@@ -1,0 +1,35 @@
+# ESP-IDF / CMake build output
+build/
+cmake-build-*/
+sdkconfig
+sdkconfig.old
+dependencies.lock
+managed_components/
+
+# PlatformIO (in case it is used instead of plain ESP-IDF)
+.pio/
+
+# Editors / IDE
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.swp
+*~
+
+# Python helpers (flash/monitor scripts)
+__pycache__/
+*.pyc
+.venv/
+
+# Recordings and logs pulled from the SD card
+*.wav
+*.raw
+*.bin
+!partitions*.bin
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
