@@ -2,6 +2,7 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "driver/gpio.h"
 #include "driver/i2s_pdm.h"
 #include "esp_attr.h"
 #include "esp_check.h"
@@ -29,8 +30,26 @@ static IRAM_ATTR bool on_recv_overflow(i2s_chan_handle_t handle, i2s_event_data_
     return false;
 }
 
+/* Drive the SEL pin of every mic (slot selection) before the PDM clock starts */
+static esp_err_t mic_sel_init(void)
+{
+    static const gpio_num_t pins[DAQ_NUM_CHANNELS] = DAQ_PIN_MIC_SEL;
+    static const uint8_t levels[DAQ_NUM_CHANNELS] = DAQ_MIC_SEL_LEVEL;
+    for (int m = 0; m < DAQ_NUM_CHANNELS; m++) {
+        gpio_config_t cfg = {
+            .pin_bit_mask = 1ULL << pins[m],
+            .mode = GPIO_MODE_OUTPUT,
+        };
+        ESP_RETURN_ON_ERROR(gpio_config(&cfg), TAG, "SEL M%d", m + 1);
+        ESP_RETURN_ON_ERROR(gpio_set_level(pins[m], levels[m]), TAG, "SEL M%d level", m + 1);
+    }
+    return ESP_OK;
+}
+
 static esp_err_t pdm_init(void)
 {
+    ESP_RETURN_ON_ERROR(mic_sel_init(), TAG, "mic_sel_init");
+
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     chan_cfg.dma_desc_num = DAQ_DMA_DESC_NUM;
     chan_cfg.dma_frame_num = DAQ_BLOCK_FRAMES;

@@ -30,6 +30,9 @@ static void print_status(void)
 {
     float levels[DAQ_NUM_CHANNELS];
     capture_get_levels(levels, DAQ_NUM_CHANNELS);
+    for (int c = 0; c < DAQ_NUM_CHANNELS; c++) {
+        g_daq.level_dbfs[c] = levels[c];   /* shared with the BLE diagnostics */
+    }
 
     printf("t=%" PRIu32 "s | dBFS", (uint32_t)(g_daq.frames_captured / DAQ_SAMPLE_RATE_HZ));
     for (int c = 0; c < DAQ_NUM_CHANNELS; c++) {
@@ -39,6 +42,7 @@ static void print_status(void)
            g_daq.recording ? "ON " : "off", g_daq.sd_file_index,
            g_daq.sd_bytes_written / 1e6, g_daq.sd_write_errors);
     printf(" | usb=%s %.1fMB", g_daq.streaming ? "ON " : "off", g_daq.usb_bytes_sent / 1e6);
+    printf(" | ble=%s", g_daq.ble_connected ? "ON " : "off");
     printf(" | drop dma=%" PRIu32 " sd=%" PRIu32 " usb=%" PRIu32 "\n",
            g_daq.dma_overflows, g_daq.sd_dropped_blocks, g_daq.usb_dropped_blocks);
 }
@@ -90,5 +94,8 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(stream_init());
     ESP_ERROR_CHECK(capture_start());
+    if (ble_init() != ESP_OK) {
+        ESP_LOGW(TAG, "BLE not available");
+    }
     xTaskCreatePinnedToCore(ui_task, "ui", 4096, NULL, 3, NULL, 0);
 }

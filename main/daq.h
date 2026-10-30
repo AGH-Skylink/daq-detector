@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
+#include "config.h"
 
 /* Shared runtime state. Counters are statistics only, so plain volatile access is enough. */
 typedef struct {
@@ -22,6 +23,10 @@ typedef struct {
     /* stream */
     volatile bool     streaming;          /* started/stopped by the host ('S' / 'X') or UI key 'u' */
     volatile uint64_t usb_bytes_sent;
+    /* ui */
+    volatile float    level_dbfs[DAQ_NUM_CHANNELS];  /* RMS over the last status period, updated by the UI task */
+    /* ble */
+    volatile bool     ble_connected;
 } daq_state_t;
 
 extern daq_state_t g_daq;
@@ -54,3 +59,15 @@ bool storage_push(const void *data, size_t len);
 esp_err_t stream_init(void);
 void stream_set_enabled(bool enabled);
 bool stream_push(const daq_packet_header_t *header, const void *data, size_t len);
+
+/* ble.c — localization output sent over BLE (docs/ble_gatt.md) */
+typedef struct {
+    float azimuth_deg;     /* 0..360, counter-clockwise from x */
+    float elevation_deg;   /* -90..90 */
+    float distance_m;      /* 0 = unknown */
+    float confidence;      /* 0..1 */
+} daq_source_t;
+
+esp_err_t ble_init(void);
+void ble_publish_result(const daq_source_t *sources, int n_sources, int speaker_count);  /* strongest first */
+void ble_publish_map(const uint8_t *map, size_t len);  /* DAQ_BLE_MAP_AZ_BINS * DAQ_BLE_MAP_EL_BINS bytes */
