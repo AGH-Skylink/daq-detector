@@ -24,3 +24,7 @@ CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
 
 # NimBLE makes the image larger than the default 1 MB app partition
 CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+
+# CPU load per core (system.c): idle task run time from esp_timer
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y

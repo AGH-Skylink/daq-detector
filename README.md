@@ -7,9 +7,17 @@ Current stage (test T0 from the project documentation): **acquisition only**. Th
 - streams them to a PC over native USB,
 - prints a level / health status line on the UART console.
 
-- exposes a BLE GATT server "AudioLoc" for the Android app (`daq-app`): live diagnostics, device info and control are real, localization results and the SRP map are placeholders until the localization module exists. Protocol: [`docs/ble_gatt.md`](docs/ble_gatt.md).
+- exposes a BLE GATT server "AudioLoc" for the Android app (`daq-app`): live diagnostics (levels, drops, battery, CPU load), device info, control, tracked speakers, per-frame sources and the SRP map. Protocol v3: [`docs/ble_gatt.md`](docs/ble_gatt.md),
+- monitors the battery (INA219 on the UPS HAT), shows the state on the on-board RGB LED and keeps settings (mic geometry, speed of sound, algorithm, map rate, tracker mode, BLE outputs) in NVS,
+- localizes speakers (firmware 0.6.0) with algorithm A (GCC-PHAT + least squares) or B (SRP-PHAT, up to 2 sources, power map) and sends
+  the result to the app over BLE; when the fit is poor only the direction is reported (distance unknown),
+- localizes with algorithm C (firmware 0.8.0): broadband MUSIC on the small triangle M1–M3, azimuth only, up to 2 sources, count from MDL,
+- counts and follows speakers over time (firmware 0.7.0): direction histogram + tracker with three selectable association modes
+  (azimuth only, azimuth × elevation, elliptical gate); BLE sends the tracked speakers and/or the per-frame sources (each switchable),
+- runs the DSP front end (firmware 0.4.0): 32 ms frames, voice activity detection and GCC-PHAT time differences for the 15 mic pairs, logged to CSV next to the WAV; a replay mode runs a WAV from the card through the same code for comparison with the Python reference in `daq-sim`.
 
-Localization will be added on top of this pipeline and will publish its output through `ble_publish_result()` / `ble_publish_map()`.
+Development plan: [`docs/firmware_plan.md`](docs/firmware_plan.md).
+
 
 ## Hardware
 
@@ -18,10 +26,10 @@ Localization will be added on top of this pipeline and will publish its output t
 | MCU | ESP32-S3-DevKitC-1 N8R8 (2× LX7 240 MHz, 8 MB octal PSRAM, 8 MB flash) | — |
 | Microphones | 6× Adafruit 3492 (ST MP34DT01-M, PDM, top port) | I2S0 PDM RX, 1 clock + 3 data lines, 6 SEL GPIOs |
 | Storage | Pololu 2597 microSD breakout | SPI2 |
-| Power | Waveshare UPS HAT (C), LiPo 1000 mAh, INA219 | 5 V → DevKitC 5V pin (INA219 not used yet) |
+| Power | Waveshare UPS HAT (C), LiPo 1000 mAh, INA219 | 5 V → DevKitC 5V pin, INA219 on I2C (0x43) |
 | Button | momentary switch to GND | GPIO16 |
 
-Array geometry: triangle M1–M3 (60 mm side) on the body, M4–M6 on three arms (350 mm radius, 120 mm below the body). Exact coordinates are in the project documentation.
+Array geometry (pinout DAQ-PIN-01 is the reference): triangle M1–M3 (60 mm side) at 90°/210°/330°, arms M4/M5/M6 at 150°/270°/30°, radius 350 mm, 161 mm below the M1–M3 plane. Default coordinates are in `config.h` (`DAQ_MIC_XYZ_MM`); measured ones are set from the console and kept in NVS.
 
 ### Wiring
 
@@ -38,8 +46,10 @@ Array geometry: triangle M1–M3 (60 mm side) on the body, M4–M6 on three arms
 | SD MISO | 13 | Pololu DO |
 | SD CS | 10 | Pololu nCS |
 | Button | 16 | to GND, internal pull-up |
-| I2C SDA / SCL | 1 / 2 | INA219 on the UPS HAT, reserved |
-| LED | 48 | on-board RGB (GPIO38 on DevKitC-1 v1.1), reserved |
+| I2C SDA / SCL | 1 / 2 | INA219 on the UPS HAT (HAT connector pins 3 / 5) |
+| LED | 48 | on-board RGB (GPIO38 on DevKitC-1 v1.1) |
+
+**UPS HAT connector:** the HAT is mirrored compared to the Raspberry Pi numbering used in the pinout. Before wiring, measure which pin carries 5 V with the HAT switched on; 5 V on the 3V3 line destroys the ESP32, mics and card.
 
 Each arm cable has 5 wires: 3V, GND, CLK, DAT, SEL (CLK and DAT twisted with GND).
 Microphones and the SD card are powered from the DevKitC 3V3 pin. The Pololu board has no pull-ups: the firmware enables the weak internal ones, external 10 kΩ to 3.3 V on DI, DO, nCS are recommended.
@@ -84,11 +94,15 @@ Configuration applied when `sdkconfig` is generated (`sdkconfig` itself is not t
 | `CONFIG_BT_NIMBLE_ROLE_CENTRAL`, `_OBSERVER` | not set | peripheral only, saves RAM |
 | `CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL` | y | NimBLE buffers in PSRAM, internal RAM stays for DMA |
 | `CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE` | y | 1.5 MB app partition, the image with BLE does not fit in 1 MB |
+| `CONFIG_FREERTOS_USE_TRACE_FACILITY`, `CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS` | y | idle task run time per core, used for the CPU load |
 
 After changing this file, delete `sdkconfig` (or run `idf.py fullclean`) so the defaults are applied again.
 
 ### `main/CMakeLists.txt`
-Registers the `main` component with its five source files.
+Registers the `main` component with its eight source files.
+
+### `main/idf_component.yml`
+Managed dependencies, downloaded by `idf.py` on the first build: `espressif/led_strip` (^3.0.0, WS2812 LED) and `espressif/esp-dsp` (^1.4.0, FFT).
 
 ### `main/config.h`
 All tunable settings in one place.
@@ -110,28 +124,49 @@ All tunable settings in one place.
 | `DAQ_SD_RING_BYTES` | 512 kB | SD ring buffer in PSRAM (~0.9 s of audio, absorbs card write stalls) |
 | `DAQ_SD_CHUNK_BYTES` | 32 kB | size of one `fwrite` |
 | `DAQ_SD_FILE_SECONDS` | 300 | length of one WAV file before gapless rotation |
+| `DAQ_SD_CSV_RING_BYTES` | 32 kB | PSRAM buffer for CSV log lines from the DSP (~3 s) |
 | `DAQ_USB_RING_BYTES` | 128 kB | USB ring buffer in PSRAM |
 | `DAQ_USB_CHUNK_BYTES` | 4096 | bytes passed to the USB driver per write |
 | `DAQ_USB_TX_BUFFER_BYTES` | 16 kB | USB-Serial-JTAG driver TX buffer |
 | `DAQ_USB_WRITE_TIMEOUT_MS` | 20 | write timeout when the PC does not read |
 | `DAQ_PIN_BUTTON` | 16 | record toggle button (active low) |
 | `DAQ_STATUS_PERIOD_MS` | 1000 | period of the console status line |
-| `DAQ_PIN_I2C_SDA`, `DAQ_PIN_I2C_SCL`, `DAQ_PIN_LED` | 1, 2, 48 | reserved for INA219 and the RGB LED, not driven yet (reported to the app) |
-| `DAQ_FW_VERSION_*` | 0.2.0 | firmware version reported over BLE |
+| `DAQ_PIN_I2C_SDA`, `DAQ_PIN_I2C_SCL` | 1, 2 | I2C bus of the INA219 |
+| `DAQ_INA219_ADDR` | 0x43 | INA219 address on the UPS HAT (confirm with an I2C scan) |
+| `DAQ_INA219_SHUNT_MOHM` | 10 | shunt resistor on the HAT |
+| `DAQ_BATTERY_CURRENT_SIGN` | −1 | sign so that + = charging; **check on the device** (plug the charger: current must go positive) |
+| `DAQ_BATTERY_RINT_MOHM` | 150 | battery + protection resistance, corrects the voltage under load before the state-of-charge lookup |
+| `DAQ_PIN_LED` | 48 | on-board WS2812 (38 on DevKitC-1 v1.1) |
+| `DAQ_LED_BRIGHTNESS` | 24 | LED brightness 0..255 |
+| `DAQ_IDENTIFY_MS` | 3000 | identify blink duration |
+| `DAQ_FW_VERSION_*` | 0.8.0 | firmware version reported over BLE |
 | `DAQ_BLE_NAME_PREFIX` | `AudioLoc-` | advertised name prefix, + last 2 bytes of the MAC |
 | `DAQ_BLE_HOP_MS` | 32 | Result notification period |
 | `DAQ_BLE_MAX_SOURCES` | 2 | sources per Result frame |
 | `DAQ_BLE_MAP_AZ_BINS`, `DAQ_BLE_MAP_EL_BINS` | 36, 18 | SRP map size (10° cells) |
-| `DAQ_BLE_MAP_RATE_HZ` | 5 | default map rate, changed from the app |
+| `DAQ_BLE_MAP_RATE_HZ` | 5 | default map rate (runtime value in NVS, changed from the app) |
 | `DAQ_BLE_TEST_PATTERN` | 0 | 1 = send one synthetic moving source and its map, to test the app and the link |
-| `DAQ_MIC_XYZ_MM` | doc v0.2 | mic coordinates reported to the app; **confirm on the device** |
+| `DAQ_SPEED_OF_SOUND_MPS` | 343.0 | default speed of sound (runtime value in NVS, changed from the app) |
+| `DAQ_ALGORITHM_DEFAULT` | 1 (GCC-PHAT + LS) | default algorithm (runtime value in NVS) |
+| `DAQ_TRACKER_MODE_DEFAULT` | 1 (azimuth only) | default tracker association mode (runtime value in NVS) |
+| `DAQ_OUTPUT_MASK_DEFAULT` | 3 (tracked + raw) | default BLE outputs (runtime value in NVS) |
+| `DAQ_TRACK_MAX` | 4 | tracks kept by the tracker |
+| `DAQ_MIC_XYZ_MM` | pinout DAQ-PIN-01 | default mic coordinates in mm, 0.1 mm resolution (runtime values in NVS) |
+
+Values marked "runtime value in NVS" are only defaults: after the first change from the app or the console the stored value wins. `defaults` in the console restores them.
 
 ### `main/daq.h`
 Shared definitions used by all modules:
 - `daq_state_t g_daq`: global runtime state, i.e. flags (`recording`, `record_request`, `streaming`, `sd_ready`, `ble_connected`), statistics (captured frames, dropped blocks, bytes written/sent, SD errors) and the last per-mic levels (`level_dbfs`).
 - `daq_packet_header_t`: header of a USB stream packet (format below).
-- `daq_source_t`: one localized source (azimuth, elevation, distance, confidence) passed to the BLE module.
-- Function prototypes of `capture.c`, `storage.c`, `stream.c` and `ble.c`.
+- `daq_source_t`: one localized source or track (azimuth, elevation, distance, confidence, track id) passed to the BLE module.
+- `daq_settings_t g_settings`: persistent settings (mic coordinates, speed of sound, algorithm, map rate, tracker mode, output mask); change them only through `settings_set_*()`.
+- `daq_track_mode_t` (1 azimuth, 2 azimuth × elevation, 3 elliptical gate), `DAQ_OUT_TRACKED` / `DAQ_OUT_RAW`, `track_out_t` (one confirmed track).
+- `daq_algorithm_t`: 0 off, 1 GCC-PHAT + LS, 2 SRP-PHAT, 3 MUSIC.
+- `dsp_result_t`: one DSP frame (first sample, VAD, energy, τ and peak for the 15 pairs); `DSP_FRAME_LEN` 2048, `DSP_HOP` 1536, `DSP_NUM_PAIRS` 15.
+- `loc_source_t` / `loc_result_t`: result of `localize_a()` / `localize_b()` (up to 2 sources: azimuth, elevation, distance, confidence, kind `P` / `D`; fit residual and pairs for A).
+- `dsp_result_t` also points to the band spectra of every mic (`xr`, `xi`), used by MUSIC.
+- Function prototypes of `capture.c`, `storage.c`, `stream.c`, `ble.c`, `system.c`, `dsp.c`, `localize.c`, `music.c` and `track.c`.
 
 ### `main/capture.c`
 Audio acquisition.
@@ -141,7 +176,7 @@ Audio acquisition.
   1. reads 320 frames from DMA,
   2. reorders slots to M1..M6 using `DAQ_CHANNEL_MAP`,
   3. accumulates per-channel energy for the level display,
-  4. pushes the block to the SD ring buffer (if recording) and to the USB ring buffer with a packet header (if streaming).
+  4. passes the block to the DSP (`dsp_push()`, with its frame index), to the SD ring buffer (if recording; the frame index of the first recorded block is kept as `rec_first_frame`) and to the USB ring buffer with a packet header (if streaming).
   The packet `seq` is incremented for every block, so the PC sees gaps when blocks are dropped.
 - `capture_get_levels()` returns the RMS level of each channel in dBFS since the previous call and resets the accumulators.
 
@@ -153,7 +188,8 @@ Recording to the microSD card.
   - writes 32 kB chunks from the ring buffer,
   - every `DAQ_SD_FILE_SECONDS` closes the file and opens the next one without losing samples,
   - on stop drains the buffer, writes the final header with the correct sizes and closes the file,
-  - stops recording on a write error.
+  - stops recording on a write error,
+  - next to every `RECnnnnn.WAV` writes `RECnnnnn.CSV` with the DSP results (lines from `storage_push_csv()`; header written with the first lines).
 - `storage_push()` adds a block to the ring buffer; returns `false` (block dropped) if there is no room.
 
 WAV format: PCM, 6 channels, 48 kHz, 16-bit, interleaved M1..M6. A file interrupted by a power loss keeps `data_size = 0`; `daq_sim.recording.load_recording` reads it using the file size.
@@ -179,28 +215,167 @@ Packet format (little-endian, 24-byte header + payload):
 
 ### `main/ble.c`
 BLE GATT server "AudioLoc" (NimBLE, peripheral). Full protocol in [`docs/ble_gatt.md`](docs/ble_gatt.md).
-- `ble_init()` starts NimBLE, registers the service (Result, SRP map, Diagnostics, Device info, Control) and starts `ble_task` (core 0, priority 4). Failure is not fatal: acquisition keeps running.
+- `ble_init()` starts NimBLE, registers the service (Result, SRP map, Diagnostics, Device info, Control, Raw result) and starts `ble_task` (core 0, priority 4). Failure is not fatal: acquisition keeps running.
 - Advertises the service UUID, name `AudioLoc-XXXX` in the scan response; re-advertises after a disconnect.
-- `ble_task` runs every 32 ms and, for the subscribed characteristics, sends the Result frame, Diagnostics every 1 s, and the SRP map at the rate set by the app (chunked to the negotiated MTU).
-- `ble_publish_result()` / `ble_publish_map()`: entry points for the future localization module. A result older than 500 ms is reported as not valid.
-- Control writes: start/stop SD recording, start/stop USB stream, SRP map rate, identify (placeholder).
-- Placeholders: Result without sources, no map, battery unknown (INA219 not read), identify only logged.
+- `ble_task` runs every 32 ms and, for the subscribed characteristics, sends the Result and Raw result frames, Diagnostics every 1 s, and the SRP map at the rate set by the app (chunked to the negotiated MTU).
+- `ble_publish_result()` (tracked speakers, track id in byte 7), `ble_publish_raw()` (sources of the frame) and `ble_publish_map()`, called from `dsp.c`. A result older than 500 ms is reported as not valid.
+- Notifications are sent only when they fit in the negotiated MTU (nothing is sent before the MTU exchange).
+- Control writes: start/stop SD recording, start/stop USB stream, SRP map rate, identify, algorithm (`07`), speed of sound (`08`), outputs (`09`), tracker mode (`0A`).
+
+### `main/system.c`
+System services, task `system` (core 0, priority 2, every 100 ms):
+- **Settings**: `settings_init()` initialises NVS (also needed by BLE) and loads `daq_settings_t` (blob version 2; a version 1 blob from firmware ≤ 0.6.0 is kept and the new fields take their defaults), falling back to the defaults from `config.h`. Every `settings_set_*()` validates the value and saves it immediately.
+- **Battery**: INA219 at 0x43, 12-bit with 128-sample averaging, read every 1 s. Current from the shunt voltage (10 µV / 10 mΩ = 1 mA per LSB), voltage from the bus register (4 mV per LSB). State of charge: open-circuit estimate `V − I·R_int` on a LiPo curve, smoothed. If the INA219 does not answer, battery data stays unknown.
+- **LED** (WS2812): white blink = identify (3 s), magenta = new lost blocks or SD error (2 s), red blink = recording, cyan = USB stream, blue = phone connected, yellow = no SD card, green = idle.
+- **CPU load**: busy time of each core over the last second, from the idle task run time.
+
+### `main/dsp.c`
+DSP front end, task `dsp` (core 1, priority 8, below capture). It implements `daq-sim/daq_sim/tdoa.py` step by step:
+- frames of 2048 samples with hop 1536 (32 ms), periodic Hann window, samples scaled by 1/32768,
+- 3 complex FFTs (esp-dsp) per frame, two real channels packed in one transform; the FFT sign convention is checked at start,
+- band 300–3500 Hz (bins 13–149),
+- VAD: band energy averaged over the mics; noise floor follows the minimum and rises at most 0.05 dB per frame; voice = 9 dB above the floor,
+- GCC-PHAT for the 15 pairs (12, 13, …, 56) evaluated directly at integer lags within the physical range + 2 samples
+  (from the mic geometry and speed of sound in NVS), parabolic refinement; τ_ij = t_i − t_j in µs and the peak value.
+
+Live mode: blocks from `capture_task` come through a queue (24 blocks, PSRAM); a lost block restarts the frame window. While recording,
+one CSV line per frame goes to `RECnnnnn.CSV`. `g_daq.dsp_frame_us` and `dsp_voice` show the processing time and the VAD.
+
+Replay mode (`play N` in the console, not while recording): reads `RECnnnnn.WAV` from the card (also a file copied from the PC,
+e.g. from `simulate_wav.py`; any 6-channel 16-bit 48 kHz WAV), processes it frame by frame (not real time; live input is ignored)
+and writes `PLYnnnnn.CSV` with `first_frame=0`. Compare on the PC: `python tools/localize_wav.py RECnnnnn.WAV --compare PLYnnnnn.CSV`
+(target max |Δτ| ≤ 1 µs).
+
+CSV format (both modes): header line `# daq-detector 0.8.0 wav=RECnnnnn.WAV first_frame=… fs=48000 c=… alg=A|B|C trk=AZ|AZEL|ELLIPSE mics=x,y,z;…` (geometry,
+speed of sound, algorithm and tracker mode actually used, mm), column line, then
+`frame, vad, energy_db, t12…t56 (µs), p12…p56, alg, kind, speakers, az_deg, el_deg, dist_m, conf, res_us, pairs, az2_deg, el2_deg, dist2_m, conf2,
+tracks, t1_id, t1_az_deg, t1_el_deg, t1_dist_m, t1_conf, t2_id, t2_az_deg, t2_el_deg, t2_dist_m, t2_conf`.
+`frame` is the capture frame index of the frame start; `frame − first_frame` is the sample index in the WAV file.
+`kind`: `P` position, `D` direction only (`dist_m` = 0), `-` no result; `res_us` / `pairs` only for algorithm A; the second source only for B and C;
+C reports azimuths only (`el_deg` = 0, `dist_m` = 0).
+Localization columns are empty for frames without voice; tracker columns are on every line (`tracks` = confirmed tracks = speakers,
+then the two most confident). A replay starts with an empty tracker (as `localize_wav.py`), live tracking restarts after it.
+
+For voice frames with algorithm A or B selected (`alg 1` / `alg 2`, BLE `07 01` / `07 02`) the DSP calls `localize_a()` / `localize_b()`;
+the sources go to BLE (Raw result; distance 0 = unknown) and, for B, the 36 × 18 power map (SRP map characteristic) at the rate set by the app.
+Every frame (also without voice) goes through the tracker (`track.c`); its confirmed tracks go to BLE Result.
+
+Host check: `dsp.c` compiled on a PC with a reference DFT in place of esp-dsp and run in replay on `simulate_wav.py --source 60 20 2.0`
+matches `daq-sim` within 0.001 µs on all 78 voice frames × 15 pairs (same VAD decisions).
+
+### `main/localize.c`
+Ports of `daq-sim/daq_sim/ls.py` and `srp.py` (same steps and constants; least squares in double precision).
+
+**Algorithm A** — `localize_a()`:
+1. linear start with M1 as reference (unknowns: position and distance to M1, 5 equations),
+2. Gauss–Newton on the used pairs (at most 10 iterations, stop when the step is below 10 µm),
+3. while the worst residual exceeds 25 µs, drop that pair and refit (at most 2 pairs),
+4. the fit is ok if finite, RMS ≤ 25 µs and the position within 8 m → kind `P`,
+5. otherwise (decision e) a plane-wave fit τ_ij = (m_j − m_i)·v with the same pair rejection; accepted if RMS ≤ 25 µs and |v|·c within
+   ±30 % of 1 → kind `D` (direction only, distance 0); otherwise no result.
+
+Confidence = mean GCC-PHAT peak of the used pairs × (1 − RMS / 25 µs).
+
+**Algorithm B (SRP-PHAT)** — `localize_b()`:
+1. coarse grid = the BLE map grid (azimuth 0–350° step 10°, elevation −85…85° step 10°) × 8 distances (0.5–6 m); the delay table
+   (5184 points × 15 pairs, PSRAM) is rebuilt when the geometry or speed of sound changes; power = sum of the pair correlations at the grid
+   delays (linear interpolation); map = maximum over distances, scaled to 0–255,
+2. up to 2 local maxima of the map: the first if power / 15 ≥ 0.15, a second one if ≥ 0.8 × the first and ≥ 40° away,
+3. pattern search around each maximum on the exact correlation at fractional delays (steps 5° / 5° / ×1.25, halved down to 1°),
+4. SRP-guided time differences (best correlation value within ±3 samples of the delays predicted by the refined point) and the
+   least-squares fit of algorithm A → kind `P` if the fit is ok, otherwise the SRP direction only (kind `D`).
+
+Confidence: of the least-squares fit for `P`, power / 15 for `D`.
+
+Simulation results (`daq-sim`, source at 60° / 20° / 2 m, SNR 30 dB, 4 s of speech-like signal):
+
+| Conditions | Algorithm | Frames with a result | Azimuth (median, p10–p90) | Elevation | Distance (kind P) |
+|---|---|---|---|---|---|
+| free field | A or B | 78 / 78 (all P) | 60.0° (59.9–60.1) | 20.0° (19.6–20.5) | 2.0 m (1.9–2.1) |
+| room 6 × 5 × 3 m, RT60 0.5 s | A | 15 / 89 (8 P, 7 D) | 59.5° (56.8–64.8) | 22° (−4…28) | 0.9 m (0.6–2.5) |
+| same room | B | 80 / 89 (33 P, 47 D) | 60.0° (58.6–80.0) | 21° (−5…25) | 1.8 m (0.6–3.7) |
+
+With two sources in the room (60° / 220°) single frames are not reliable for counting (two sources in 28 of 89 frames, sometimes a reflection);
+counting is done over time by `track.c`.
+
+Host check: `dsp.c` + `localize.c` compiled on a PC (reference DFT in place of esp-dsp) and run in replay on the four simulated recordings match
+`daq-sim` exactly (same kind and number of sources in every frame, directions and distances equal to the printed precision).
+Device cost not measured yet: B evaluates the exact correlation a few hundred times per source; check `loc` time in the status line
+(must leave room in the 32 ms frame together with `dsp`).
+
+### `main/music.c`
+Algorithm C, port of `daq-sim/daq_sim/music.py` (decisions 02.11.2026: separate algorithm, azimuth only, ~0.5 s averaging).
+`localize_c()` is called by `dsp.c` for **every** frame (the covariance also decays without voice) when algorithm 3 is selected
+(`alg 3`, BLE `07 03`); a result row is produced for voice frames:
+1. 40 single FFT bins spread over 300–2800 Hz (below the 2.9 kHz phase-ambiguity limit of the 60 mm triangle),
+2. per bin the M1–M3 snapshot normalised to unit length (spectral whitening), 3 × 3 covariance averaged exponentially
+   over ~16 frames (λ = 15/16, voice frames only, all frames decay); a result needs a weight ≥ 4 (≈ 4 recent voice frames),
+3. eigen-decomposition of each 3 × 3 Hermitian matrix (complex Jacobi, double); speaker count K = 1 or 2 from MDL summed over the
+   bins (`MDL_PENALTY` 1 = standard MDL),
+4. pseudospectrum on a 1° azimuth grid (elevation 0; the planar triangle cannot tell +el from −el), mean over bins of
+   1 / |E<sub>n</sub><sup>H</sup> a|² (steering table 40 × 360 × 3 in PSRAM, rebuilt after a geometry or speed-of-sound change),
+5. the K largest local maxima with parabolic refinement; confidence = 1 − mean projection on the noise subspace.
+
+Sources go to the tracker and BLE like those of A and B (kind `D`, elevation 0, distance 0). No SRP map with C.
+Host check: C replay identical to `daq-sim` on the three simulated recordings (same counts, azimuths within 0.01°).
+Simulation (`tools/evaluate.py`, see `daq-sim`): azimuth of the matched sources within ~1–7° on average, but the MDL count reports 2
+for a single speaker in most rooms (the floor reflection is coherent with the source), so C counts speakers poorly.
+
+### `main/track.c`
+Port of `daq-sim/daq_sim/track.py` (decision 1c: direction histogram + tracker), in double precision; `track_update()` is called by
+`dsp.c` for every frame with the sources of the frame (none without voice):
+1. histogram of directions with a 1 s half-life; each source adds 1 (centre 1, neighbours 0.5 / 0.25); AZ mode: 36 azimuth bins,
+   AZEL / ELLIPSE: the 36 × 18 map grid,
+2. each source (most confident first) updates the nearest track within the 20° gate (smoothing 0.3 of direction, distance, confidence);
+   otherwise a new tentative track is born if the histogram at its cell is ≥ 1.5 (at most 4 tracks, ids 1–255),
+3. a track is confirmed after 4 hits; a tentative track dies after 0.3 s without an update, a confirmed one after 1.5 s,
+4. tracks closer than the merge distance are merged (the older one stays): 30° in azimuth for AZ, 10° otherwise,
+5. output: confirmed tracks by decreasing confidence; their number = speakers.
+
+Modes (console `trk N`, BLE `0A nn`, stored in NVS; a change restarts the tracker):
+
+| Mode | Distance | Room, 2 speakers (60° / 220°) | Room, 1 speaker | Free field | Trade-off |
+|---|---|---|---|---|---|
+| 1 AZ (default) | wrapped azimuth difference | 2 tracks in 91 / 124 frames | 1 track | 1 track | robust to unstable elevation; speakers < 30° apart in azimuth count as one |
+| 2 AZEL | great-circle angle | 2nd speaker in 5 frames | ghost track (3 tracks in 52 frames) | 1 track | separates heights; needs a reliable elevation |
+| 3 ELLIPSE | 20° × max(Δaz / 15°, Δel / 45°) | 2nd speaker in 14 frames | ghost persists (2 tracks in 85 frames) | 1 track | compromise |
+
+(simulation, algorithm B, RT60 0.5 s; to be repeated on real recordings with `play N` + `localize_wav.py --track …`.)
+Host check: C replay identical to Python in all three modes (same counts and ids in every frame).
 
 ### `main/main.c`
-- `app_main()` initialises storage (continues without SD if the card is missing), the USB stream, the capture and BLE (continues without it), then starts the UI task.
+- `app_main()` initialises settings/NVS, storage (continues without SD if the card is missing), the USB stream, the capture, BLE (continues without it) and the system task, then starts the UI task.
 - `ui_task` (core 0, priority 3) polls the UART console and the button every 20 ms and prints the status line.
 
-Console keys: `r` start/stop SD recording, `u` start/stop USB stream, `h` help. The button on GPIO16 also toggles recording.
+Console keys (act immediately): `r` start/stop SD recording, `u` start/stop USB stream, `i` identify, `h` help. The button on GPIO16 also toggles recording.
+
+Console line commands (typed with echo, end with Enter), saved to NVS immediately:
+
+| Command | Effect |
+|---|---|
+| `mic` | list mic positions |
+| `mic N X Y Z` | set position of mic N (1..6) in mm, e.g. `mic 4 -301.5 176.2 -160.0` (geometry calibration) |
+| `c` / `c 341.5` | show / set speed of sound (300..380 m/s) |
+| `alg` / `alg 2` | show / set algorithm (0 off, 1 GCC-PHAT + LS, 2 SRP-PHAT, 3 MUSIC on M1–M3) |
+| `trk` / `trk 2` | show / set tracker mode (1 azimuth, 2 azimuth × elevation, 3 elliptical gate) |
+| `out` / `out 1` | show / set BLE outputs: 1 tracked Result, 2 Raw result, 3 both, 0 none |
+| `defaults` | restore all settings from `config.h` |
+| `play N` | replay `RECnnnnn.WAV` through the DSP → `PLYnnnnn.CSV` (not while recording); progress in the status line |
 
 Status line example:
 ```
-t=42s | dBFS M1: -52.3 M2: -51.8 M3: -53.0 M4: -50.9 M5: -52.1 M6: -51.5 | rec=ON  REC00003 12.4MB err=0 | usb=ON  20.1MB | ble=ON  | drop dma=0 sd=0 usb=0
+t=42s | dBFS M1: -52.3 M2: -51.8 M3: -53.0 M4: -50.9 M5: -52.1 M6: -51.5 | rec=ON  REC00003 12.4MB err=0 | usb=ON  20.1MB | ble=ON  | bat=78% 3912mV -182mA | cpu=21/38% | dsp=9.8ms vad=1 | src az=60 el=20 d=2.0m n=1 (0.6ms) | spk=1 az=60 | drop dma=0 sd=0 usb=0 dsp=0 csv=0
 ```
 - `dBFS`: RMS level of each mic over the last second (≈ −120 means no signal),
 - `rec`: recording state, current file, total bytes written, write errors,
 - `usb`: stream state and total bytes sent,
 - `ble`: phone connected,
-- `drop dma / sd / usb`: lost blocks in capture / SD path / USB path; all should stay 0.
+- `bat`: state of charge, voltage, current (+ charging, − discharging), only if the INA219 answers,
+- `cpu`: load of core 0 / core 1,
+- `dsp`: processing time of the last frame (must stay well below 32 ms) and its VAD decision; during a replay `replay NN%`,
+- `src`: last result (azimuth, elevation, distance — 0 = direction only, number of sources) and the localization time, shown for 1 s after the last result,
+- `spk`: confirmed tracks (speakers) and the direction of the most confident one,
+- `drop dma / sd / usb / dsp / csv`: lost blocks in capture / SD path / USB path / DSP queue, lost CSV lines; all should stay 0.
 
 ## Build and run
 
@@ -222,7 +397,12 @@ Connect both DevKitC ports to the PC:
 2. **Capture**: `drop dma` stays 0.
 3. **SD**: record a few minutes (`r`); `drop sd` and `err` stay 0. If not, lower `DAQ_SD_FREQ_KHZ`, add external pull-ups or move to SDMMC (same wiring).
 4. **BLE**: connect with the app, check that Diagnostics shows the same levels as the console and `drop dma` stays 0 with BLE connected. Set `DAQ_BLE_TEST_PATTERN` to 1 to see a moving source in the Live view.
-5. **USB**: run the PC script; `drop usb` and `lost` stay 0 at ~576 kB/s. If not, native USB-Serial-JTAG is too slow: switch to TinyUSB CDC or stream fewer channels / a lower rate.
+5. **DSP and localization**: `dsp=` time well below 32 ms, `drop dsp=0`; `vad=1` and a plausible `src` when talking near the array;
+   the Live view of the app shows the source. Then record a few seconds, run `play N`
+   and compare `PLYnnnnn.CSV` with `daq-sim` (`localize_wav.py --compare`). A synthetic WAV from `simulate_wav.py` copied to the card as
+   `RECnnnnn.WAV` checks the whole chain without microphones.
+6. **Battery**: `bat=` appears in the status line; plug the charger and check that the current goes positive (otherwise flip `DAQ_BATTERY_CURRENT_SIGN`).
+7. **USB**: run the PC script; `drop usb` and `lost` stay 0 at ~576 kB/s. If not, native USB-Serial-JTAG is too slow: switch to TinyUSB CDC or stream fewer channels / a lower rate.
 
 ## Related
 

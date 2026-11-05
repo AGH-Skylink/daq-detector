@@ -83,6 +83,7 @@ static void capture_task(void *arg)
     static int16_t out[BLOCK_SAMPLES];
     uint32_t seq = 0;
     size_t got = 0;
+    bool was_recording = false;
 
     for (int i = 0; i < WARMUP_BLOCKS; i++) {
         i2s_channel_read(s_rx_chan, raw, BLOCK_BYTES, &got, portMAX_DELAY);
@@ -112,8 +113,17 @@ static void capture_task(void *arg)
         s_level_frames += DAQ_BLOCK_FRAMES;
         portEXIT_CRITICAL(&s_level_lock);
 
-        if (g_daq.recording && !storage_push(out, BLOCK_BYTES)) {
-            g_daq.sd_dropped_blocks++;
+        dsp_push(out, g_daq.frames_captured);
+        if (g_daq.recording) {
+            if (!was_recording) {
+                g_daq.rec_first_frame = g_daq.frames_captured;   /* first block of this recording */
+                was_recording = true;
+            }
+            if (!storage_push(out, BLOCK_BYTES)) {
+                g_daq.sd_dropped_blocks++;
+            }
+        } else {
+            was_recording = false;
         }
         if (g_daq.streaming) {
             daq_packet_header_t header = {

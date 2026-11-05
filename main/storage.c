@@ -18,6 +18,9 @@ static const char *TAG = "storage";
 
 static StreamBufferHandle_t s_ring;
 static StaticStreamBuffer_t s_ring_struct;
+static StreamBufferHandle_t s_csv_ring;      /* text lines from dsp.c */
+static StaticStreamBuffer_t s_csv_ring_struct;
+static char s_csv_chunk[2048];
 static uint8_t *s_chunk;          /* internal, DMA-capable buffer for fwrite */
 static sdmmc_card_t *s_card;
 
@@ -82,7 +85,7 @@ static esp_err_t sd_mount(void)
 
     esp_vfs_fat_sdmmc_mount_config_t mount_cfg = {
         .format_if_mount_failed = false,
-        .max_files = 2,
+        .max_files = 4,   /* WAV + CSV while recording, WAV + CSV in replay */
         .allocation_unit_size = 32 * 1024,
     };
     ESP_RETURN_ON_ERROR(esp_vfs_fat_sdspi_mount(DAQ_SD_MOUNT_POINT, &host, &slot, &mount_cfg, &s_card),
@@ -137,15 +140,62 @@ static bool write_chunk(FILE *f, size_t n, uint32_t *data_bytes)
     return true;
 }
 
+/* CSV log next to the WAV file (same number). The header needs the frame index of the WAV start,
+ * which capture sets with the first block, so it is written together with the first lines. */
+typedef struct {
+    FILE *f;
+    bool header_pending;
+    uint64_t file_first_byte;   /* audio bytes of this recording session before this WAV file */
+} csv_log_t;
+
+static void csv_open(csv_log_t *log, uint64_t session_bytes)
+{
+    char path[32];
+    snprintf(path, sizeof(path), DAQ_SD_MOUNT_POINT "/REC%05lu.CSV", (unsigned long)g_daq.sd_file_index);
+    log->f = fopen(path, "w");
+    log->header_pending = true;
+    log->file_first_byte = session_bytes;
+}
+
+static void csv_drain(csv_log_t *log)
+{
+    size_t n;
+    while ((n = xStreamBufferReceive(s_csv_ring, s_csv_chunk, sizeof(s_csv_chunk), 0)) > 0) {
+        if (!log->f) {
+            continue;   /* no file: discard */
+        }
+        if (log->header_pending) {
+            char name[16], header[1024];
+            snprintf(name, sizeof(name), "REC%05lu.WAV", (unsigned long)g_daq.sd_file_index);
+            uint64_t first = g_daq.rec_first_frame + log->file_first_byte / (DAQ_NUM_CHANNELS * sizeof(int16_t));
+            fwrite(header, 1, dsp_csv_header(header, sizeof(header), name, first), log->f);
+            log->header_pending = false;
+        }
+        fwrite(s_csv_chunk, 1, n, log->f);
+    }
+}
+
+static void csv_close(csv_log_t *log)
+{
+    csv_drain(log);
+    if (log->f) {
+        fclose(log->f);
+        log->f = NULL;
+    }
+}
+
 static void storage_task(void *arg)
 {
     FILE *f = NULL;
+    csv_log_t csv = { 0 };
     uint32_t data_bytes = 0;
+    uint64_t session_bytes = 0;
     TickType_t file_start = 0;
 
     while (true) {
         if (!f) {
             if (!g_daq.record_request) {
+                xStreamBufferReset(s_csv_ring);
                 vTaskDelay(pdMS_TO_TICKS(50));
                 continue;
             }
@@ -155,30 +205,38 @@ static void storage_task(void *arg)
                 continue;
             }
             data_bytes = 0;
+            session_bytes = 0;
+            csv_open(&csv, session_bytes);
             file_start = xTaskGetTickCount();
             g_daq.recording = true;   /* capture starts pushing from now on */
         }
 
         size_t n = xStreamBufferReceive(s_ring, s_chunk, DAQ_SD_CHUNK_BYTES, pdMS_TO_TICKS(100));
         bool ok = (n == 0) || write_chunk(f, n, &data_bytes);
+        csv_drain(&csv);
 
         if (!ok || !g_daq.record_request) {
-            /* Stop: block new data, drain what is buffered, finalise the file */
+            /* Stop: block new data, drain what is buffered, finalise the files */
             g_daq.recording = false;
             while (ok && (n = xStreamBufferReceive(s_ring, s_chunk, DAQ_SD_CHUNK_BYTES, 0)) > 0) {
                 ok = write_chunk(f, n, &data_bytes);
             }
             xStreamBufferReset(s_ring);
             close_file(f, data_bytes);
+            csv_close(&csv);
             f = NULL;
             g_daq.record_request = false;
         } else if (xTaskGetTickCount() - file_start >= pdMS_TO_TICKS(DAQ_SD_FILE_SECONDS * 1000)) {
             /* Gapless rotation: capture keeps pushing, the ring buffer absorbs the reopen time */
             close_file(f, data_bytes);
+            csv_close(&csv);
+            session_bytes += data_bytes;
             f = open_next_file();
             data_bytes = 0;
             file_start = xTaskGetTickCount();
-            if (!f) {
+            if (f) {
+                csv_open(&csv, session_bytes);
+            } else {
                 g_daq.recording = false;
                 g_daq.record_request = false;
                 xStreamBufferReset(s_ring);
@@ -195,6 +253,11 @@ esp_err_t storage_init(void)
         return ESP_ERR_NO_MEM;
     }
     s_ring = xStreamBufferCreateStatic(DAQ_SD_RING_BYTES, DAQ_SD_CHUNK_BYTES, ring_mem, &s_ring_struct);
+    uint8_t *csv_mem = heap_caps_malloc(DAQ_SD_CSV_RING_BYTES + 1, MALLOC_CAP_SPIRAM);
+    if (!csv_mem) {
+        return ESP_ERR_NO_MEM;
+    }
+    s_csv_ring = xStreamBufferCreateStatic(DAQ_SD_CSV_RING_BYTES, 1, csv_mem, &s_csv_ring_struct);
 
     ESP_RETURN_ON_ERROR(sd_mount(), TAG, "sd_mount");
     g_daq.sd_ready = true;
@@ -210,4 +273,13 @@ bool storage_push(const void *data, size_t len)
         return false;
     }
     return xStreamBufferSend(s_ring, data, len, 0) == len;
+}
+
+bool storage_push_csv(const char *line, size_t len)
+{
+    /* Single producer (dsp_task): a line goes in whole or not at all */
+    if (!s_csv_ring || xStreamBufferSpacesAvailable(s_csv_ring) < len) {
+        return false;
+    }
+    return xStreamBufferSend(s_csv_ring, line, len, 0) == len;
 }
