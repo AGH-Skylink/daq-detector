@@ -36,3 +36,5 @@ desktop.ini
 
 # Files delivered by Claude (documentation PDFs etc.), not part of the firmware
 Claude outputs/
+
+.vscode/
