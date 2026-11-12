@@ -28,3 +28,9 @@ CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
 # CPU load per core (system.c): idle task run time from esp_timer
 CONFIG_FREERTOS_USE_TRACE_FACILITY=y
 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+
+# -Og is too slow for the DSP (frame > 32 ms budget, dsp drops); -O2 also avoids the GCC 15.2 -Og ICE
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# NimBLE logs every notification at INFO (31 Hz x 2 lines), floods the UART console
+CONFIG_BT_NIMBLE_LOG_LEVEL_WARNING=y

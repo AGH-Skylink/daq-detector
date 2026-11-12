@@ -414,7 +414,7 @@ static long wav_open_data(FILE *f)
 
 static void run_replay(int index)
 {
-    char wav[40], csv[40], name[16], line[800];
+    char wav[48], csv[48], name[24], line[800];   /* sized for any int index (-Wformat-truncation at -O2) */
     snprintf(name, sizeof(name), "REC%05d.WAV", index);
     snprintf(wav, sizeof(wav), DAQ_SD_MOUNT_POINT "/%s", name);
     snprintf(csv, sizeof(csv), DAQ_SD_MOUNT_POINT "/PLY%05d.CSV", index);

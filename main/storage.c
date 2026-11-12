@@ -165,7 +165,7 @@ static void csv_drain(csv_log_t *log)
             continue;   /* no file: discard */
         }
         if (log->header_pending) {
-            char name[16], header[1024];
+            char name[24], header[1024];   /* "REC" + up to 10 digits + ".WAV" */
             snprintf(name, sizeof(name), "REC%05lu.WAV", (unsigned long)g_daq.sd_file_index);
             uint64_t first = g_daq.rec_first_frame + log->file_first_byte / (DAQ_NUM_CHANNELS * sizeof(int16_t));
             fwrite(header, 1, dsp_csv_header(header, sizeof(header), name, first), log->f);
