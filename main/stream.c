@@ -1,6 +1,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/stream_buffer.h"
+#include "freertos/semphr.h"
 #include "driver/usb_serial_jtag.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
@@ -12,11 +13,16 @@ static const char *TAG = "stream";
 
 static StreamBufferHandle_t s_ring;
 static StaticStreamBuffer_t s_ring_struct;
+/* Two producers (capture task: audio, dsp task: CSV text): a packet goes into the ring under this mutex,
+ * header and payload together, so packets never interleave */
+static SemaphoreHandle_t s_push_lock;
 
 void stream_set_enabled(bool enabled)
 {
     if (enabled && !g_daq.streaming) {
+        xSemaphoreTake(s_push_lock, portMAX_DELAY);
         xStreamBufferReset(s_ring);   /* start from a clean packet boundary */
+        xSemaphoreGive(s_push_lock);
     }
     g_daq.streaming = enabled;
     ESP_LOGI(TAG, "USB stream %s", enabled ? "ON" : "OFF");
@@ -60,6 +66,10 @@ esp_err_t stream_init(void)
         return ESP_ERR_NO_MEM;
     }
     s_ring = xStreamBufferCreateStatic(DAQ_USB_RING_BYTES, 1, ring_mem, &s_ring_struct);
+    s_push_lock = xSemaphoreCreateMutex();
+    if (!s_push_lock) {
+        return ESP_ERR_NO_MEM;
+    }
 
     usb_serial_jtag_driver_config_t cfg = {
         .tx_buffer_size = DAQ_USB_TX_BUFFER_BYTES,
@@ -71,13 +81,29 @@ esp_err_t stream_init(void)
     return ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
+/* Header and payload go in together or not at all */
+static bool push_packet(const void *header, size_t header_len, const void *data, size_t len)
+{
+    xSemaphoreTake(s_push_lock, portMAX_DELAY);
+    bool ok = xStreamBufferSpacesAvailable(s_ring) >= header_len + len;
+    if (ok) {
+        xStreamBufferSend(s_ring, header, header_len, 0);
+        xStreamBufferSend(s_ring, data, len, 0);
+    }
+    xSemaphoreGive(s_push_lock);
+    return ok;
+}
+
 bool stream_push(const daq_packet_header_t *header, const void *data, size_t len)
 {
-    /* Single producer: header and payload go in together or not at all */
-    if (xStreamBufferSpacesAvailable(s_ring) < sizeof(*header) + len) {
+    return push_packet(header, sizeof(*header), data, len);
+}
+
+bool stream_push_text(const char *text, size_t len)
+{
+    if (len == 0 || len > UINT16_MAX) {
         return false;
     }
-    xStreamBufferSend(s_ring, header, sizeof(*header), 0);
-    xStreamBufferSend(s_ring, data, len, 0);
-    return true;
+    daq_text_header_t h = { .magic = DAQ_TEXT_MAGIC, .length = (uint16_t)len, .reserved = 0 };
+    return push_packet(&h, sizeof(h), text, len);
 }

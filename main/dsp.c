@@ -13,7 +13,8 @@
  * Localization (0.6.0): for voice frames with algorithm A or B selected, localize_a() / localize_b()
  * (localize.c) or C (music.c, azimuth only) give up to 2 sources; the tracker (track.c) turns them into speakers over time (every frame).
  * Live output: BLE Result = confirmed tracks, Raw result = sources of the frame (each switchable,
- * g_settings.output_mask), SRP map for B. Both modes write sources and tracks to the CSV.
+ * g_settings.output_mask), SRP map for B. Both modes write sources and tracks to the CSV; live, the CSV goes to the SD
+ * card while recording and to the native USB stream (DAQT text packets) while the stream is on.
  */
 #include <math.h>
 #include <stdio.h>
@@ -479,6 +480,8 @@ static void dsp_task(void *arg)
 {
     static dsp_block_t blk;
     static char line[800];
+    static char header[1024];
+    bool usb_header_sent = false;
     int have = 0;              /* frames in s_win */
     int blk_pos = DAQ_BLOCK_FRAMES;
     uint64_t win_start = 0, expected = 0;
@@ -531,9 +534,25 @@ static void dsp_task(void *arg)
         const loc_result_t *lp = locate(&r, &loc, &map_fresh);
         int n_trk = track(&r, lp, trk);
         publish(&r, lp, map_fresh, trk, n_trk);
-        if (g_daq.recording && win_start >= g_daq.rec_first_frame) {
-            if (!storage_push_csv(line, csv_line(line, sizeof(line), &r, lp, trk, n_trk))) {
+        bool to_sd = g_daq.recording && win_start >= g_daq.rec_first_frame;
+        bool to_usb = g_daq.streaming;
+        if (!to_usb) {
+            usb_header_sent = false;
+        }
+        if (to_sd || to_usb) {
+            int len = csv_line(line, sizeof(line), &r, lp, trk, n_trk);
+            if (to_sd && !storage_push_csv(line, len)) {
                 g_daq.csv_dropped_lines++;
+            }
+            if (to_usb) {
+                /* detection log on the USB stream (DAQT packets): CSV header once per stream start, then every
+                 * frame; `frame` = capture sample index, the same clock as first_frame of the audio packets */
+                if (!usb_header_sent) {
+                    usb_header_sent = stream_push_text(header, dsp_csv_header(header, sizeof(header), "usb", 0));
+                }
+                if (!usb_header_sent || !stream_push_text(line, len)) {
+                    g_daq.csv_dropped_lines++;
+                }
             }
         }
         memmove(s_win, s_win + DSP_HOP * NCH, (N - DSP_HOP) * NCH * sizeof(int16_t));

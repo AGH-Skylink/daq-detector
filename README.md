@@ -74,7 +74,8 @@ Each block is 320 frames (6.67 ms at 48 kHz, 3840 bytes). The two ring buffers a
 ## Files
 
 ### `CMakeLists.txt`
-Standard ESP-IDF project file; project name `daq-detector`.
+ESP-IDF project file; project name `daq-detector`. `MINIMAL_BUILD ON` builds only the components that `main` requires
+(faster, and it skips `esp_lcd`, whose RGB panel driver crashes GCC 15.2 of ESP-IDF v6.1 at `-Og`).
 
 ### `sdkconfig.defaults`
 Configuration applied when `sdkconfig` is generated (`sdkconfig` itself is not tracked in git):
@@ -95,11 +96,14 @@ Configuration applied when `sdkconfig` is generated (`sdkconfig` itself is not t
 | `CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL` | y | NimBLE buffers in PSRAM, internal RAM stays for DMA |
 | `CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE` | y | 1.5 MB app partition, the image with BLE does not fit in 1 MB |
 | `CONFIG_FREERTOS_USE_TRACE_FACILITY`, `CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS` | y | idle task run time per core, used for the CPU load |
+| `CONFIG_COMPILER_OPTIMIZATION_PERF` | y | `-O2`: with the default `-Og` a DSP frame takes longer than 32 ms (`drop dsp` grows) |
+| `CONFIG_BT_NIMBLE_LOG_LEVEL_WARNING` | y | NimBLE logs every notification at INFO (31 Hz × 2 lines) and floods the console |
 
 After changing this file, delete `sdkconfig` (or run `idf.py fullclean`) so the defaults are applied again.
 
 ### `main/CMakeLists.txt`
-Registers the `main` component with its eight source files.
+Registers the `main` component with its ten source files and the ESP-IDF components it uses (`PRIV_REQUIRES`: GPIO, I2C, I2S,
+SPI, SD over SPI, USB-Serial-JTAG, timer, FATFS, SDMMC, BT, NVS); with `MINIMAL_BUILD` nothing else is built.
 
 ### `main/idf_component.yml`
 Managed dependencies, downloaded by `idf.py` on the first build: `espressif/led_strip` (^3.0.0, WS2812 LED) and `espressif/esp-dsp` (^1.4.0, FFT).
@@ -200,6 +204,13 @@ Streaming to the PC over native USB (USB-Serial-JTAG, the DevKitC port labelled 
 - `stream_task` reads host commands (`S` = start, `X` = stop) and sends the ring buffer content in 4 kB writes. If the PC does not read, writes time out and new blocks are dropped (`drop usb`).
 - `stream_set_enabled()` starts or stops streaming (also from the console key `u`).
 - `stream_push()` adds header + payload atomically, or drops the block if there is no room.
+- `stream_push_text()` adds a text packet (`DAQT`) the same way. Audio (capture task) and text (DSP task) are written
+  under one mutex, so a packet is never split by another.
+
+While the stream is on, the DSP task also sends the **detection log**: the CSV header block once per stream start, then
+one CSV line per DSP frame (32 ms) with the same columns as the SD card CSV (`dsp.c`): frame, VAD, energy, 15 time
+differences and peaks, algorithm result (up to 2 sources), tracker output. `frame` is the capture sample index, the
+same clock as `first_frame` of the audio packets. A line that does not fit in the ring counts in `drop csv`.
 
 Packet format (little-endian, 24-byte header + payload):
 
@@ -212,6 +223,15 @@ Packet format (little-endian, 24-byte header + payload):
 | `channels` | u16 | 6 |
 | `frames` | u16 | 320 |
 | payload | i16 × frames × channels | samples interleaved M1..M6 |
+
+Text packet (detection log), 8-byte header + ASCII:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `magic` | u32 | `0x54514144` ("DAQT") |
+| `length` | u16 | number of text bytes |
+| `reserved` | u16 | 0 |
+| text | `length` bytes | CSV header block (`# daq-detector … wav=usb first_frame=0 …` + column line) or one CSV line with `\n` |
 
 ### `main/ble.c`
 BLE GATT server "AudioLoc" (NimBLE, peripheral). Full protocol in [`docs/ble_gatt.md`](docs/ble_gatt.md).
@@ -375,11 +395,13 @@ t=42s | dBFS M1: -52.3 M2: -51.8 M3: -53.0 M4: -50.9 M5: -52.1 M6: -51.5 | rec=O
 - `dsp`: processing time of the last frame (must stay well below 32 ms) and its VAD decision; during a replay `replay NN%`,
 - `src`: last result (azimuth, elevation, distance — 0 = direction only, number of sources) and the localization time, shown for 1 s after the last result,
 - `spk`: confirmed tracks (speakers) and the direction of the most confident one,
-- `drop dma / sd / usb / dsp / csv`: lost blocks in capture / SD path / USB path / DSP queue, lost CSV lines; all should stay 0.
+- `drop dma / sd / usb / dsp / csv`: lost blocks in capture / SD path / USB path / DSP queue, lost CSV lines (SD and USB detection log); all should stay 0.
 
 ## Build and run
 
-Requires ESP-IDF v5.3 or newer.
+Requires ESP-IDF v5.3 or newer; built and run with ESP-IDF v6.1 (GCC 15.2). In VS Code (ESP-IDF extension): *Set Espressif
+Device Target* → `esp32s3`, *Select Flash Method* → UART, *Select Port* → the CP210x port, then *Build*, *Flash*, *Monitor*.
+On Windows keep the project in a path without spaces or non-ASCII characters.
 
 ```
 idf.py set-target esp32s3
@@ -389,7 +411,29 @@ idf.py -p <UART_PORT> flash monitor
 
 Connect both DevKitC ports to the PC:
 - **UART port (CP2102N)**: flashing and console (`idf.py monitor`),
-- **USB port (native)**: binary stream, read with `daq-sim/tools/usb_record.py`.
+- **USB port (native)**: binary stream, read with `tools/daq_term.py` (below) or `daq-sim/tools/usb_record.py`.
+
+### `tools/daq_term.py`
+Terminal monitor for both ports at once: the USB stream (packets, throughput, lost packets / resyncs, RMS and peak level of
+M1..M6, optional WAV on the PC) and the UART console (status line and log; keys `r`, `i`, `h` go to the ESP).
+
+```
+pip install pyserial numpy rich
+python tools/daq_term.py --uart COM3 --usb COM4            # COM numbers from the Device Manager
+python tools/daq_term.py --uart COM3 --usb COM4 --plain --duration 30   # one line per second, no UI
+```
+
+Keys: `s` stream on/off (on at start), `w` WAV on the PC (`recordings/`), `l` detection CSV on the PC
+(`recordings/det_*.csv`), `r` SD recording, `i` identify, `h` ESP help, `c` clear counters, `q` quit.
+`--csv` writes the detection CSV from the start. The CSV has the columns of the SD card CSV plus `pc_time_s` (PC receive
+time, Unix seconds) to align it with other logs, e.g. the source position of `daq-sim/tools/live_source.py`. The
+`detect` row shows the last result and tracks, the number of lines and missing frames (`gaps`).
+
+```
+python tools/daq_term.py --uart COM3 --usb COM4 --csv                    # detection CSV from the start
+python tools/daq_term.py --uart "" --usb COM4 --plain --csv --duration 60   # 60 s, no UI
+``` Run it with the Windows Python (PowerShell), not from WSL: WSL does not see `COMx` ports.
+One program per port: close the VS Code monitor first.
 
 ## First run checklist
 
@@ -402,9 +446,12 @@ Connect both DevKitC ports to the PC:
    and compare `PLYnnnnn.CSV` with `daq-sim` (`localize_wav.py --compare`). A synthetic WAV from `simulate_wav.py` copied to the card as
    `RECnnnnn.WAV` checks the whole chain without microphones.
 6. **Battery**: `bat=` appears in the status line; plug the charger and check that the current goes positive (otherwise flip `DAQ_BATTERY_CURRENT_SIGN`).
-7. **USB**: run the PC script; `drop usb` and `lost` stay 0 at ~576 kB/s. If not, native USB-Serial-JTAG is too slow: switch to TinyUSB CDC or stream fewer channels / a lower rate.
+7. **USB**: run `tools/daq_term.py`; `drop usb` and `lost` stay 0 at ~576 kB/s. If not, native USB-Serial-JTAG is too slow: switch to TinyUSB CDC or stream fewer channels / a lower rate.
+8. **Hardware in the loop** (without microphones): a Raspberry Pi Pico 2 with `daq-sim/pico_emu` feeds PDM streams of a known source
+   (CLK GPIO4 → GP2, GP3/4/5 → GPIO5/6/7, common GND); guide in `daq-sim/docs/hardware_in_the_loop.md`. The firmware needs no changes.
 
 ## Related
 
 - `daq-app`: Android app (Kotlin, Jetpack Compose) — live view, diagnostics, device control.
-- `daq-sim`: PC tools (USB receiver, recording loader) and offline algorithm development in Python.
+- `daq-sim` (repository `daq-simulator`): PC tools (USB receiver, recording loader), offline algorithm development in Python,
+  evaluation of T1–T5 in simulation and the Pico 2 PDM emulator for hardware-in-the-loop tests.

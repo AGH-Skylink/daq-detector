@@ -91,6 +91,15 @@ extern daq_settings_t g_settings;
  * and detects lost packets by gaps in `seq`.
  */
 #define DAQ_STREAM_MAGIC 0x31514144u   /* "DAQ1" */
+#define DAQ_TEXT_MAGIC   0x54514144u   /* "DAQT": text packet, one CSV line of the detection log */
+
+/* Text packet on the USB stream: header followed by `length` bytes of ASCII (a CSV line with '\n', or the
+ * CSV header block). Sent while the stream is on, between audio packets, never inside one. */
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint16_t length;
+    uint16_t reserved;
+} daq_text_header_t;
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;
@@ -114,6 +123,7 @@ bool storage_push_csv(const char *line, size_t len);   /* CSV log next to the cu
 esp_err_t stream_init(void);
 void stream_set_enabled(bool enabled);
 bool stream_push(const daq_packet_header_t *header, const void *data, size_t len);
+bool stream_push_text(const char *text, size_t len);   /* DAQT packet; false if the ring is full or len > 65535 */
 
 /* system.c — NVS settings, battery (INA219), status LED, CPU load */
 esp_err_t settings_init(void);   /* also initialises NVS (needed by BLE) */

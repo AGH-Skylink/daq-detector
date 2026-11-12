@@ -58,10 +58,12 @@ Core 1: capture (priority 10) and DSP (lower priority). Core 0: BLE, SD, USB, UI
 - Done (0.7.0): speaker tracker (3 modes), BLE tracked + raw outputs — see the decision below.
 - Done (0.8.0): algorithm C (MUSIC) in daq-sim and firmware; `daq-sim/tools/evaluate.py` (simulated T1–T5, threshold sweep); project documentation v0.5.
 - Next (hardware):
-  1. first ESP-IDF build (`ble.c`, `system.c`, `main.c` were not compiled on the PC),
+  1. ~~first ESP-IDF build~~ done with ESP-IDF v6.1: `MINIMAL_BUILD`, `PRIV_REQUIRES`, `-O2` (at `-Og` the DSP frame exceeded 32 ms),
   2. before power-up: measure the 5 V pin of the UPS HAT connector (mirrored), 10 kΩ pull-ups on the SD lines,
   3. T0: tap test of every mic (order M1–M6 / `DAQ_CHANNEL_MAP`), `drop` counters 0, SD recording, USB stream,
   4. INA219 current sign (`DAQ_BATTERY_CURRENT_SIGN`) and battery percentage,
+  4b. hardware in the loop with the Pico 2 emulator (`daq-sim/docs/hardware_in_the_loop.md`): channel mapping (`tone N`),
+      live source vs the ESP result for A, B, C, static and rotating,
   5. `dsp` + `loc` times: B must fit in 32 ms together with the DSP, otherwise make the B refinement cheaper,
   6. measured geometry of the built device (`mic N x y z`),
   7. T1: one speaker at known positions, `play N` + `localize_wav.py --compare`,

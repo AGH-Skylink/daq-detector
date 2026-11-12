@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """daq_term: terminal monitor for daq-detector.
 
-  USB  (native USB-Serial-JTAG): binary stream of DAQ1 packets -> parsed, stats, levels, optional WAV.
+  USB  (native USB-Serial-JTAG): binary stream of DAQ1 packets -> parsed, stats, levels, optional WAV;
+       DAQT text packets = detection log (one CSV line per DSP frame) -> last result, optional CSV file.
   UART (CP2102N console):        log lines + status line, keys forwarded to the ESP console.
 
 Usage:
@@ -11,11 +12,14 @@ Usage:
 Keys:
   s  start/stop USB stream (host command S / X)
   w  start/stop WAV recording on the PC (6 ch, 16 bit, 48 kHz; lost blocks filled with zeros)
+  l  start/stop the detection CSV on the PC (columns of the SD card CSV + pc_time_s)
   r  SD recording on the ESP     i  identify (LED)     h  ESP help (output in the log)
   c  clear counters              q  quit
 
 Packet (little-endian): magic u32 0x31514144 "DAQ1", seq u32, first_frame u64,
 sample_rate u32, channels u16, frames u16, then i16[frames][channels].
+Text packet: magic u32 0x54514144 "DAQT", length u16, reserved u16, then `length` bytes of ASCII: the CSV
+header block ("# daq-detector ..." + column line) once per stream start, then one CSV line per frame.
 """
 
 import argparse
@@ -32,7 +36,9 @@ import numpy as np
 import serial
 
 MAGIC = b"DAQ1"                      # 0x31514144 little-endian
+TMAGIC = b"DAQT"                     # 0x54514144: text packet (detection CSV)
 HDR = struct.Struct("<IIQIHH")       # 24 bytes
+THDR = struct.Struct("<IHH")         # 8 bytes
 MAX_FRAMES = 4096
 MAX_CHANNELS = 16
 
@@ -60,6 +66,12 @@ class UsbStream:
         self.wav = None
         self.wav_name = None
         self.wav_frames = 0
+        self.csv = None              # open detection CSV file
+        self.csv_name = None
+        self.csv_lines = 0
+        self.csv_pending = False     # --csv: open the file as soon as the header arrives
+        self.det_columns = None      # column names from the header block
+        self.det_header = None       # header block as received
         self.error = None
         self.reset_counters()
 
@@ -80,6 +92,12 @@ class UsbStream:
             self.peak = None
             self.nsamp = 0
             self.rate_hist = collections.deque(maxlen=20)   # (t, bytes_total)
+            self.det_lines = 0           # CSV lines received
+            self.det_voice = 0
+            self.det_gaps = 0            # missing frames between consecutive lines
+            self.det_last_frame = None
+            self.det_last = None         # dict of the last line
+            self.det_last_src = None     # dict of the last line with a source
 
     # host commands
     def set_streaming(self, on):
@@ -107,12 +125,39 @@ class UsbStream:
             self.wav_frames = 0
             return f"WAV recording: {self.wav_name}"
 
+    # PC-side detection CSV
+    def toggle_csv(self):
+        with self.lock:
+            if self.csv:
+                self.csv.close()
+                self.csv = None
+                return f"CSV saved: {self.csv_name} ({self.csv_lines} lines)"
+            if not self.det_header:
+                self.csv_pending = True
+                return "CSV: waiting for the header (it comes when the stream starts: s, s)"
+            return self._open_csv()
+
+    def _open_csv(self):
+        os.makedirs("recordings", exist_ok=True)
+        self.csv_name = os.path.join(
+            "recordings", datetime.datetime.now().strftime("det_%Y%m%d_%H%M%S.csv"))
+        self.csv = open(self.csv_name, "w", encoding="utf-8", newline="")
+        lines = self.det_header.rstrip("\n").split("\n")
+        lines[-1] += ",pc_time_s"          # column line: + PC receive time (to align with other logs)
+        self.csv.write("\n".join(lines) + "\n")
+        self.csv_lines = 0
+        self.csv_pending = False
+        return f"CSV recording: {self.csv_name}"
+
     def close(self):
         self.running = False
         with self.lock:
             if self.wav:
                 self.wav.close()
                 self.wav = None
+            if self.csv:
+                self.csv.close()
+                self.csv = None
 
     # reader thread
     def run(self):
@@ -135,7 +180,7 @@ class UsbStream:
         pos = 0
         n = len(buf)
         while True:
-            idx = buf.find(MAGIC, pos)
+            idx = find_magic(buf, pos)
             if idx < 0:
                 # keep the last 3 bytes, they may be the start of a magic word
                 keep = max(pos, n - 3)
@@ -145,6 +190,22 @@ class UsbStream:
                 return
             if idx != pos:
                 self.resyncs += 1
+            if buf[idx:idx + 4] == TMAGIC:
+                if n - idx < THDR.size:
+                    del buf[:idx]
+                    return
+                _, length, _ = THDR.unpack_from(buf, idx)
+                end = idx + THDR.size + length
+                if length == 0 or length > 4096:
+                    self.bad_headers += 1
+                    pos = idx + 1
+                    continue
+                if n < end:
+                    del buf[:idx]
+                    return
+                self._text(bytes(buf[idx + THDR.size:end]).decode("ascii", "replace"))
+                pos = end
+                continue
             if n - idx < HDR.size:
                 del buf[:idx]
                 return
@@ -158,15 +219,43 @@ class UsbStream:
             if n < end + 4:                  # wait for the next magic as well
                 del buf[:idx]
                 return
-            if buf[end:end + 4] != MAGIC:
+            if buf[end:end + 4] not in (MAGIC, TMAGIC):
                 # short write on the ESP side: the packet was cut and the next one starts inside it
-                j = buf.find(MAGIC, idx + 4, end)
+                j = find_magic(buf, idx + 4, end)
                 if j >= 0:
                     self.bad_headers += 1
                     pos = j
                     continue
             self._packet(seq, first_frame, rate, ch, frames, bytes(buf[idx + HDR.size:end]))
             pos = end
+
+    def _text(self, text):
+        if text.startswith("#"):
+            self.det_header = text
+            self.det_columns = text.rstrip("\n").split("\n")[-1].split(",")
+            self.det_last_frame = None
+            if self.csv_pending and not self.csv:
+                self._open_csv()
+            return
+        if self.det_columns is None:
+            return
+        line = text.rstrip("\n")
+        row = dict(zip(self.det_columns, line.split(",")))
+        self.det_lines += 1
+        try:
+            frame = int(row.get("frame", ""))
+            if self.det_last_frame is not None and frame - self.det_last_frame > 1536:
+                self.det_gaps += (frame - self.det_last_frame) // 1536 - 1
+            self.det_last_frame = frame
+        except ValueError:
+            pass
+        self.det_voice += row.get("vad") == "1"
+        self.det_last = row
+        if row.get("az_deg"):
+            self.det_last_src = row
+        if self.csv:
+            self.csv.write(f"{line},{time.time():.3f}\n")
+            self.csv_lines += 1
 
     def _packet(self, seq, first_frame, rate, ch, frames, payload):
         if self.fmt != (rate, ch, frames) or self.sumsq is None:
@@ -223,6 +312,9 @@ class UsbStream:
                 seq=self.last_seq, first_frame=self.last_first_frame, fmt=self.fmt,
                 dbfs=dbfs, peak=pk, clip=clip, uptime=now - self.t0,
                 wav=self.wav_name if self.wav else None,
+                det_lines=self.det_lines, det_voice=self.det_voice, det_gaps=self.det_gaps,
+                det_last=self.det_last, det_src=self.det_last_src,
+                csv=self.csv_name if self.csv else None, csv_lines=self.csv_lines,
                 wav_s=self.wav_frames / (self.fmt[0] if self.fmt else 48000),
                 streaming=self.streaming, error=self.error)
 
@@ -265,6 +357,30 @@ class UartConsole:
     def snapshot(self, n):
         with self.lock:
             return self.status, list(self.lines)[-n:]
+
+
+def find_magic(buf, start, end=None):
+    """Earliest DAQ1 or DAQT magic in buf[start:end], -1 if none."""
+    end = len(buf) if end is None else end
+    hits = [i for i in (buf.find(MAGIC, start, end), buf.find(TMAGIC, start, end)) if i >= 0]
+    return min(hits) if hits else -1
+
+
+def det_summary(s):
+    """One line: last localization result and tracks from the detection log."""
+    r, src = s["det_last"], s["det_src"]
+    if not r:
+        return "no detection lines (firmware 0.8.0+ sends them while the stream is on)"
+    out = f"lines {s['det_lines']} voice {s['det_voice']} gaps {s['det_gaps']} | vad {r.get('vad', '?')}"
+    if src:
+        out += (f" | {src.get('alg', '?')}/{src.get('kind', '?')} az {src.get('az_deg')} el {src.get('el_deg')}"
+                f" d {src.get('dist_m')} conf {src.get('conf')}")
+        if src.get("az2_deg"):
+            out += f" + az {src.get('az2_deg')}"
+    tr = r.get("tracks", "")
+    if tr:
+        out += f" | tracks {tr}" + (f" t1 az {r.get('t1_az_deg')}" if r.get("t1_id") else "")
+    return out
 
 
 def strip_ansi(s):
@@ -371,6 +487,9 @@ def render(usb, uart, msg, args):
             t.add_row("format", f"{s['fmt'][0]} Hz × {s['fmt'][1]} ch × {s['fmt'][2]} fr", "", "")
         if s["wav"]:
             t.add_row("WAV", Text(f"● {s['wav']}  {s['wav_s']:.1f} s", style="bold red"), "", "")
+        if s["csv"]:
+            t.add_row("CSV", Text(f"● {s['csv']}  {s['csv_lines']} lines", style="bold red"), "", "")
+        t.add_row("detect", Text(det_summary(s), style="bold"), "", "")
 
         lv = Table(box=None, padding=(0, 1), show_header=True, header_style="dim")
         lv.add_column("mic")
@@ -399,7 +518,7 @@ def render(usb, uart, msg, args):
         parts.append(Panel(st, title=title + " · status", border_style="magenta"))
         parts.append(Panel(log, title="log", border_style="dim", height=args.log_lines + 2))
 
-    keys = "[b]s[/b] stream  [b]w[/b] WAV  [b]r[/b] SD rec  [b]i[/b] identify  [b]h[/b] help  [b]c[/b] clear  [b]q[/b] quit"
+    keys = "[b]s[/b] stream  [b]w[/b] WAV  [b]l[/b] CSV  [b]r[/b] SD rec  [b]i[/b] identify  [b]h[/b] help  [b]c[/b] clear  [b]q[/b] quit"
     parts.append(Text.from_markup(keys + (f"   │ {msg}" if msg else "")))
     return Group(*parts)
 
@@ -415,6 +534,7 @@ def run_plain(usb, uart, args):
             print(f"usb {s['rate'] / 1000:7.1f} kB/s pk={s['packets']} lost={s['lost']} "
                   f"resync={s['resyncs']} bad={s['bad']} jumps={s['jumps']} seq={s['seq']} dBFS {lv}",
                   flush=True)
+            print("det", det_summary(s), flush=True)
         if uart and uart.status:
             print("uart", uart.status, flush=True)
 
@@ -428,6 +548,7 @@ def main():
     ap.add_argument("--log-lines", type=int, default=10)
     ap.add_argument("--plain", action="store_true", help="no UI, print stats once per second")
     ap.add_argument("--duration", type=float, default=0, help="with --plain: stop after N s")
+    ap.add_argument("--csv", action="store_true", help="write the detection CSV from the start (recordings/det_*.csv)")
     args = ap.parse_args()
 
     usb = uart = None
@@ -441,6 +562,8 @@ def main():
             threads.append(threading.Thread(target=uart.run, daemon=True))
     except serial.SerialException as e:
         sys.exit(f"Cannot open port: {e}")
+    if usb and args.csv:
+        usb.csv_pending = True
     for th in threads:
         th.start()
     if usb and not args.no_autostart:
@@ -468,6 +591,8 @@ def main():
                             msg = f"stream {'ON' if usb.streaming else 'OFF'}"
                         elif k == "w" and usb:
                             msg = usb.toggle_wav()
+                        elif k == "l" and usb:
+                            msg = usb.toggle_csv()
                         elif k == "c" and usb:
                             usb.reset_counters()
                             msg = "counters cleared"
@@ -489,6 +614,8 @@ def main():
         usb.close()
         if usb.wav_name:
             print(f"WAV: {usb.wav_name}")
+        if usb.csv_name:
+            print(f"CSV: {usb.csv_name} ({usb.csv_lines} lines)")
     if uart:
         uart.running = False
 
