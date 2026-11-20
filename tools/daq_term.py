@@ -751,11 +751,12 @@ def main():
     ap.add_argument("--no-pc-loc", action="store_true", help="no localization on the PC")
     ap.add_argument("--sim", help="daq-simulator folder (contains daq_sim/); default: next to daq-detector or $DAQ_SIM")
     ap.add_argument("--track", default="AZ", choices=["AZ", "AZEL", "ELLIPSE"], help="tracker mode on the PC")
-    ap.add_argument("--pc-alg", default="GRH",
+    ap.add_argument("--pc-alg", default="BGRK",
                     help="algorithms on the PC: A, B, C (whole array, need the full geometry), G (group M1-M3), "
-                         "R (group M4-M6), H (hybrid of G and R); default GRH")
-    ap.add_argument("--show", help="radars to draw, e.g. GRH (default: all computed); with --pc-alg ABCGRH all six "
-                                    "methods are computed and logged but only these are drawn")
+                         "R (group M4-M6), H (hybrid of G and R), K (Kalman of B+R+G, the smoothed result); "
+                         "default BGRK")
+    ap.add_argument("--show", default="BRK", help="radars to draw (default BRK); everything in --pc-alg is computed "
+                                                   "and logged, only these are drawn")
     ap.add_argument("--pc-log", action="store_true",
                     help="start the session log (key g) as soon as the stream runs: recordings/pc_<time>/")
     ap.add_argument("--vad", default="steady", choices=["steady", "device"],

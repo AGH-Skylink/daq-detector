@@ -488,7 +488,14 @@ still differ by more than 30° it keeps the more accurate one. `A`, `B`, `C` use
 The radars draw the mics from the geometry in use (M1–M3 enlarged, otherwise they would be one dot), `*` = last frame,
 `.` = results of the last 3 s, letters = confirmed speakers (`a` = track #1). `--vad steady` (default) keeps a steady source
 detected (VAD floor = quietest frame of the last 30 s); `--vad device` uses the firmware rule, with which a steady sound stops
-counting as voice after ~6 s. **Session log** (key `g`, or `--pc-log` from the start): `recordings/pc_<time>/` with `frames.csv` (every frame: voice
+counting as voice after ~6 s. **K = Kalman B+R+G** (default `--pc-alg BGRK --show BRK`): the smoothed result. One azimuth Kalman filter (constant
+velocity) takes the per-frame directions of B, R and G as separate measurements, each with its own accuracy and outlier
+gate (3.5 σ, at least 20°); 5 frames in a row that agree outside the gate make it jump (the source moved fast); the estimate
+is held 0.8 s without measurements and dropped after 3 s. Tuned on a 112 s session with a source walking around the array:
+on frames where the methods agree it covers 99.8 % with a median error of 2.9–3.5° and ~2 % of errors above 30°, against
+10.5° / 12 % for the tracker of H and ~25° jumps per frame of raw B. The constants are `K_*` in `pc_localize.py`.
+
+**Session log** (key `g`, or `--pc-log` from the start): `recordings/pc_<time>/` with `frames.csv` (every frame: voice
 decision, band energy, the 15 time differences and GCC-PHAT peaks), `results.csv` (every frame × method: frame result with
 up to 2 sources, residual / closure, time, and the tracker output), `groups.csv` (direction of each group also when rejected,
 closure, accuracy, matched rotation), `info.txt` (geometry, settings) and `M1..M6.wav`. To log all methods at once while

@@ -30,9 +30,79 @@ from pathlib import Path
 
 import numpy as np
 
-ALGS = ("A", "B", "C", "G", "R", "H")
+ALGS = ("A", "B", "C", "G", "R", "H", "K")
 ALG_NAMES = {"A": "GCC-PHAT + LS", "B": "SRP-PHAT", "C": "MUSIC M1-M3",
-             "G": "group M1-M3", "R": "group M4-M6", "H": "hybrid M1-M3 + M4-M6"}
+             "G": "group M1-M3", "R": "group M4-M6", "H": "hybrid M1-M3 + M4-M6", "K": "Kalman B+R+G"}
+
+# K: one azimuth Kalman filter (constant velocity) fed with the per-frame directions of B, R and G as separate
+# measurements, each with its own accuracy and its own outlier gate. Tuned on a 112 s session of this array with
+# a moving source (pc_20261120_140412): against the consensus of the methods it covered 99.8 % of the frames with a
+# median error of 2.9 deg and 1.7 % of errors > 30 deg, where the old tracker had 10.5 deg / 12 % and raw B jumped
+# ~25 deg per frame. Directions of the groups are used as they are (no rotation between the groups).
+K_NOISE_DEG = {"B": 6.9, "R": 7.7, "G": 14.3, "A": 6.0}   # robust error of each method on that session
+K_Q = 6400.0                 # acceleration noise, (deg/s^2)^2: allows a person walking around the array
+K_GATE_SIGMA, K_GATE_MIN_DEG = 3.5, 20.0
+K_REACQUIRE = 5              # frames in a row outside the gate that agree with each other -> jump to them
+K_HOLD_S = 0.8               # keep showing the estimate this long without accepted measurements
+K_RESET_S = 3.0              # forget the source after this long
+
+
+class AzKalman:
+    def __init__(self, dt):
+        self.dt = dt
+        self.F = np.array([[1.0, dt], [0.0, 1.0]])
+        self.Q = K_Q * np.array([[dt ** 4 / 4, dt ** 3 / 2], [dt ** 3 / 2, dt ** 2]])
+        self.x = None
+        self.P = None
+        self.since = 1e9          # frames since the last accepted measurement
+        self.pending = []
+
+    def step(self, meas):
+        """meas: list of (az_deg, el_deg, sigma_deg). Returns (az, el) or None (nothing to show)."""
+        if self.x is not None:
+            self.x = self.F @ self.x
+            self.P = self.F @ self.P @ self.F.T + self.Q
+        self.since += 1
+        if meas:
+            if self.x is None:
+                self._start(meas)
+            else:
+                used = 0
+                for az, el, sig in sorted(meas, key=lambda m: m[2]):
+                    y = wrap180(az - self.x[0])
+                    s = self.P[0, 0] + sig ** 2
+                    if abs(y) <= max(K_GATE_MIN_DEG, K_GATE_SIGMA * np.sqrt(s)):
+                        k = self.P[:, 0] / s
+                        self.x = self.x + k * y
+                        self.P = self.P - np.outer(k, self.P[0, :])
+                        if not used:
+                            self.el = el
+                        used += 1
+                if used:
+                    self.since = 0
+                    self.pending = []
+                else:
+                    self.pending.append(circ_mean([m[0] for m in meas])[0])
+                    if (len(self.pending) >= K_REACQUIRE and
+                            max(abs(wrap180(p - circ_mean(self.pending)[0])) for p in self.pending) < K_GATE_MIN_DEG):
+                        self._start(meas, circ_mean(self.pending)[0])
+            self.x[0] %= 360.0
+            self.x[1] = float(np.clip(self.x[1], -180.0, 180.0))
+        if self.x is None:
+            return None
+        if self.since * self.dt > K_RESET_S:
+            self.x = None
+            self.pending = []
+            return None
+        return (float(self.x[0]), float(self.el)) if self.since * self.dt <= K_HOLD_S else None
+
+    def _start(self, meas, az=None):
+        best = min(meas, key=lambda m: m[2])
+        self.x = np.array([best[0] if az is None else az, 0.0])
+        self.P = np.diag([best[2] ** 2, 60.0 ** 2])
+        self.el = best[1]
+        self.since = 0
+        self.pending = []
 
 # Group mode (G, R, H): the shape of each group (body M1-M3, arms M4-M6) is known, their relative position is not.
 # Each group gives a far-field direction from its own 3 pairs only (plane wave in the group plane: azimuth and
@@ -222,7 +292,7 @@ def _track_cols(tracks):
 
 
 class PcLocalizer:
-    def __init__(self, sim_path=None, config_h=None, track_mode="AZ", algs="GRH", group_offset=None, vad="steady"):
+    def __init__(self, sim_path=None, config_h=None, track_mode="AZ", algs="BGRK", group_offset=None, vad="steady"):
         self.sim_path = find_daq_sim(sim_path)
         from daq_sim.geometry import load_geometry
         from daq_sim.track import MODES
@@ -262,6 +332,9 @@ class PcLocalizer:
         self.vad_mode = vad
         self.energy_hist = collections.deque(maxlen=STEADY_VAD_WINDOW)
         self.log = None                                        # SessionLog while logging
+        self.kalman = AzKalman(1536 / 48000)
+        self.k_meas = {}                                       # frame -> (voice, measurements) waiting for B
+        self._grp = None                                       # (G, R) of the current frame
         self._rebuild = None                       # (geometry, source name): rebuild in the worker
         self._build()
         self.main_thread = threading.Thread(target=self._run, daemon=True)
@@ -280,6 +353,9 @@ class PcLocalizer:
         self.music = Music(g) if "C" in self.algs else None
         self.trackers = {a: Tracker(g.fs, MODES[self.track_mode]) for a in ALGS}
         self.buf = np.zeros((0, 6), dtype=np.int16)
+        if hasattr(self, "kalman"):
+            self.kalman = AzKalman(1536 / 48000)
+            self.k_meas = {}
         self.buf_start = None                      # capture frame index of buf[0]
         self.next_frame = None                     # expected first_frame of the next block
         if getattr(self, "b_proc", None):
@@ -364,6 +440,20 @@ class PcLocalizer:
                 self._alg_a(r)
             if "C" in self.algs:
                 self._alg_c(r)
+            if "K" in self.algs:
+                meas = []
+                if r.voice and self._grp:
+                    for key, d in zip("GR", self._grp):
+                        if d["ok"]:
+                            meas.append((d["az"], d["el"], K_NOISE_DEG[key]))
+                if r.voice and "A" in self.algs and self.state["A"].last_frame == frame and self.state["A"].sources:
+                    src = self.state["A"].sources[0]
+                    meas.append((src[0], src[1], K_NOISE_DEG["A"]))
+                self._grp = None
+                if self.b_proc:
+                    self.k_meas[frame] = (r.voice, meas)     # finished by the B order thread with B's result
+                else:
+                    self._k_step(frame, r.voice, meas)
             if self.b_proc:
                 job = None
                 with self.b_cond:
@@ -435,6 +525,7 @@ class PcLocalizer:
                     self._publish(a, r, "-", [], 0.0)
             return
         g, a = self._group("G", r), self._group("R", r)
+        self._grp = (g, a)
         if g["ok"] and a["ok"]:
             self.match.append(wrap180(a["az"] - g["az"]))
         off = self.match_offset()
@@ -531,20 +622,32 @@ class PcLocalizer:
                 if gen != self.b_gen:
                     continue
                 if res is None:
+                    sources = []
                     self._publish_b(frame, voice, [], 0.0, False)
                 else:
                     ms, kind, sources = res
                     self._publish_b(frame, voice, sources, ms, True, kind)
+                if "K" in self.algs:
+                    kv, meas = self.k_meas.pop(frame, (voice, []))
+                    if sources:
+                        meas = meas + [(sources[0][0], sources[0][1], K_NOISE_DEG["B"])]
+                    self._k_step(frame, kv, meas)
         except Exception as e:
             self.error = f"PC localization B: {e!r}"
 
-    def _publish_b(self, frame, voice, sources, ms, computed, kind="-"):
-        tracks = self.trackers["B"].update(frame, sources)
+    def _k_step(self, frame, voice, meas):
+        t0 = time.perf_counter()
+        est = self.kalman.step(meas)
+        src = [(est[0], est[1], 0.0, 1.0)] if est else []
+        self._publish_b(frame, voice, src, (time.perf_counter() - t0) * 1000, True, "D" if src else "-", alg="K")
+
+    def _publish_b(self, frame, voice, sources, ms, computed, kind="-", alg="B"):
+        tracks = self.trackers[alg].update(frame, sources)
         if self.log:
-            self.log.write("results", [frame, "B", voice, computed, kind, len(sources)] + _src_cols(sources)
+            self.log.write("results", [frame, alg, voice, computed, kind, len(sources)] + _src_cols(sources)
                            + [None, ms] + _track_cols(tracks))
         with self.lock:
-            s = self.state["B"]
+            s = self.state[alg]
             s.frames += 1
             if voice:
                 s.voice += 1
@@ -717,7 +820,7 @@ def main():
     ap.add_argument("rec")
     ap.add_argument("--sim")
     ap.add_argument("--config")
-    ap.add_argument("--pc-alg", default="GRH")
+    ap.add_argument("--pc-alg", default="BGRK")
     ap.add_argument("--track", default="AZ")
     ap.add_argument("--group-offset", type=float)
     ap.add_argument("--vad", default="steady", choices=["steady", "device"])
