@@ -18,6 +18,7 @@ Keys:
      (16 bit, 48 kHz; lost blocks filled with zeros)
   l  start/stop the detection CSV on the PC (columns of the SD card CSV + pc_time_s)
   p  PC localization on/off
+  g  session log on/off: recordings/pc_<time>/ with the results of all methods, TDOA, groups and M1..M6.wav
   r  SD recording on the ESP     i  identify (LED)     h  ESP help (output in the log)
   c  clear counters              q  quit
 
@@ -194,7 +195,7 @@ class UsbStream:
             w.close()
         self.wav = None
 
-    def toggle_wav(self):
+    def toggle_wav(self, folder=None):
         with self.lock:
             if self.wav:
                 self._close_wav()
@@ -202,7 +203,7 @@ class UsbStream:
             if not self.fmt:
                 return "WAV: no packets yet, start the stream first (s)"
             rate, ch, _ = self.fmt
-            self.wav_name = os.path.join(
+            self.wav_name = folder or os.path.join(
                 "recordings", datetime.datetime.now().strftime("usb_%Y%m%d_%H%M%S"))
             os.makedirs(self.wav_name, exist_ok=True)
             writers = []
@@ -215,6 +216,25 @@ class UsbStream:
             self.wav = writers
             self.wav_frames = 0
             return f"WAV recording: {self.wav_name}/M1..M{ch}.wav"
+
+    # PC localization session: logs of all methods + the audio, one folder
+    def toggle_session(self):
+        if not self.loc:
+            return "session log needs the PC localization (daq-sim)"
+        if self.loc.log:
+            folder = str(self.loc.log.folder)
+            rows = self.loc.stop_log()
+            if self.wav:
+                self.toggle_wav()
+            return f"session saved: {folder} ({rows} log rows + M1..M6.wav)"
+        if not self.fmt:
+            return "session: no packets yet, start the stream first (s)"
+        folder = os.path.join("recordings", datetime.datetime.now().strftime("pc_%Y%m%d_%H%M%S"))
+        if self.wav:
+            self.toggle_wav()
+        self.toggle_wav(folder)
+        self.loc.start_log(folder)
+        return f"session log: {folder} (results of all methods, TDOA, groups, M1..M6.wav) - g = stop"
 
     # PC-side detection CSV
     def toggle_csv(self):
@@ -620,7 +640,7 @@ def render(usb, uart, msg, args):
         parts.append(Panel(Group(t, Text(""), lv), title=title, border_style="cyan"))
 
     if usb and usb.loc:
-        parts.append(render_loc(usb.loc.snapshot()))
+        parts.append(render_loc(usb.loc.snapshot(), args.show))
 
     if uart:
         status, lines = uart.snapshot(args.log_lines)
@@ -632,12 +652,12 @@ def render(usb, uart, msg, args):
         parts.append(Panel(st, title=title + " · status", border_style="magenta"))
         parts.append(Panel(log, title="log", border_style="dim", height=args.log_lines + 2))
 
-    keys = "[b]s[/b] stream  [b]w[/b] WAV  [b]l[/b] CSV  [b]p[/b] PC loc  [b]r[/b] SD rec  [b]i[/b] identify  [b]h[/b] help  [b]c[/b] clear  [b]q[/b] quit"
+    keys = "[b]s[/b] stream  [b]w[/b] WAV  [b]l[/b] CSV  [b]p[/b] PC loc  [b]g[/b] session log  [b]r[/b] SD rec  [b]i[/b] identify  [b]h[/b] help  [b]c[/b] clear  [b]q[/b] quit"
     parts.append(Text.from_markup(keys + (f"   │ {msg}" if msg else "")))
     return Group(*parts)
 
 
-def render_loc(snap):
+def render_loc(snap, show=None):
     """Panel with the PC localization: one radar + numbers per algorithm."""
     from rich.panel import Panel
     from rich.table import Table
@@ -647,6 +667,8 @@ def render_loc(snap):
     grid = Table.grid(padding=(0, 3))
     cols = []
     for a, s in snap["algs"].items():
+        if show and a not in show.upper():
+            continue
         grid.add_column()
         t = Text()
         t.append(f"{a}  {s['name']}\n", style="bold")
@@ -697,6 +719,9 @@ def run_plain(usb, uart, args):
     t_end = time.monotonic() + args.duration if args.duration else None
     while t_end is None or time.monotonic() < t_end:
         time.sleep(1)
+        if args.pc_log and usb and usb.loc and usb.fmt and not usb.loc.log:
+            print(usb.toggle_session(), flush=True)
+            args.pc_log = False
         if usb:
             s = usb.snapshot()
             lv = " ".join(f"{d:6.1f}" for d in s["dbfs"]) if s["dbfs"] is not None else "-"
@@ -729,6 +754,10 @@ def main():
     ap.add_argument("--pc-alg", default="GRH",
                     help="algorithms on the PC: A, B, C (whole array, need the full geometry), G (group M1-M3), "
                          "R (group M4-M6), H (hybrid of G and R); default GRH")
+    ap.add_argument("--show", help="radars to draw, e.g. GRH (default: all computed); with --pc-alg ABCGRH all six "
+                                    "methods are computed and logged but only these are drawn")
+    ap.add_argument("--pc-log", action="store_true",
+                    help="start the session log (key g) as soon as the stream runs: recordings/pc_<time>/")
     ap.add_argument("--vad", default="steady", choices=["steady", "device"],
                     help="PC voice detection: steady = floor is the quietest frame of the last 30 s (a steady source "
                          "stays detected), device = the firmware rule (floor rises 0.05 dB/frame, a steady sound fades "
@@ -779,6 +808,9 @@ def main():
         try:
             with Live(render(usb, uart, msg, args), refresh_per_second=8, screen=True) as live:
                 while True:
+                    if args.pc_log and usb and usb.loc and usb.fmt and not usb.loc.log:
+                        msg = usb.toggle_session()
+                        args.pc_log = False
                     k = keys.get()
                     if k:
                         k = k.lower()
@@ -791,6 +823,8 @@ def main():
                             msg = usb.toggle_wav()
                         elif k == "l" and usb:
                             msg = usb.toggle_csv()
+                        elif k == "g" and usb:
+                            msg = usb.toggle_session()
                         elif k == "p" and usb and usb.loc:
                             usb.loc.enabled = not usb.loc.enabled
                             msg = f"PC localization {'ON' if usb.loc.enabled else 'OFF'}"
@@ -814,6 +848,8 @@ def main():
             usb.set_streaming(False)
         except serial.SerialException:
             pass
+        if usb.loc and usb.loc.log:
+            print(usb.toggle_session())
         usb.close()
         if usb.loc:
             usb.loc.close()

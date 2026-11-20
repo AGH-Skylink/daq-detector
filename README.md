@@ -488,8 +488,13 @@ still differ by more than 30° it keeps the more accurate one. `A`, `B`, `C` use
 The radars draw the mics from the geometry in use (M1–M3 enlarged, otherwise they would be one dot), `*` = last frame,
 `.` = results of the last 3 s, letters = confirmed speakers (`a` = track #1). `--vad steady` (default) keeps a steady source
 detected (VAD floor = quietest frame of the last 30 s); `--vad device` uses the firmware rule, with which a steady sound stops
-counting as voice after ~6 s. Offline, the same code on a recording: `python tools/pc_localize.py recordings/usb_… [--pc-alg GRHABC]` (summary per algorithm
-and the matched rotation).
+counting as voice after ~6 s. **Session log** (key `g`, or `--pc-log` from the start): `recordings/pc_<time>/` with `frames.csv` (every frame: voice
+decision, band energy, the 15 time differences and GCC-PHAT peaks), `results.csv` (every frame × method: frame result with
+up to 2 sources, residual / closure, time, and the tracker output), `groups.csv` (direction of each group also when rejected,
+closure, accuracy, matched rotation), `info.txt` (geometry, settings) and `M1..M6.wav`. To log all methods at once while
+drawing only some: `python tools/daq_term.py --uart COM13 --usb COM12 --pc-alg ABCGRH --show GRH --pc-log`.
+Offline, the same code on a recording: `python tools/pc_localize.py recordings/usb_… [--pc-alg GRHABC] [--log FOLDER]` (summary per algorithm
+and the matched rotation; `--log` writes the same session logs).
 
 Options: `--sim PATH` (folder with `daq_sim/`, default: `../daq-simulator`, `../daq-sim` or `$DAQ_SIM`), `--track AZ|AZEL|ELLIPSE`,
 `--pc-alg` (any of `ABCGRH`), `--config` (default geometry), `--no-pc-loc`. Key `p` turns it on/off, `c` also restarts the

@@ -18,6 +18,7 @@ Threads and processes:
 A lost USB block restarts the frame window (like dsp.c); the VAD floor and the trackers keep running.
 """
 import collections
+import csv
 import multiprocessing as mp
 import os
 import queue
@@ -138,6 +139,88 @@ class AlgState:
     history: collections.deque = field(default_factory=lambda: collections.deque(maxlen=400))   # (t, az)
 
 
+class SessionLog:
+    """CSV logs of one session (key g in daq_term), all in one folder:
+      frames.csv   every frame: voice decision, band energy, 15 time differences (us) and GCC-PHAT peaks
+                   (enough to rerun any localization / smoothing method offline)
+      results.csv  every frame x algorithm: frame result (up to 2 sources), fit residual / closure, time,
+                   and the tracker output after the frame (up to 2 speakers)
+      groups.csv   group mode: direction of each group (also when rejected), closure, accuracy, matched rotation
+      info.txt     geometry, speed of sound, algorithms, tracker and VAD mode
+    pc_time_s is the PC clock (Unix seconds), frame the capture sample index (same as the ESP detection log)."""
+    def __init__(self, folder, loc):
+        from daq_sim.geometry import PAIRS
+        self.folder = Path(folder)
+        self.folder.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.Lock()
+        names = [f"{i + 1}{j + 1}" for i, j in PAIRS]
+        self.f = {k: open(self.folder / f"{k}.csv", "w", newline="", encoding="utf-8")
+                  for k in ("frames", "results", "groups")}
+        self.w = {k: csv.writer(f) for k, f in self.f.items()}
+        self.w["frames"].writerow(["pc_time_s", "frame", "voice", "energy_db"] + [f"t{n}_us" for n in names]
+                                  + [f"p{n}" for n in names])
+        self.w["results"].writerow(["pc_time_s", "frame", "alg", "voice", "computed", "kind", "n",
+                                    "az1", "el1", "dist1", "conf1", "az2", "el2", "dist2", "conf2", "resid_us", "ms",
+                                    "speakers", "s1_id", "s1_az", "s1_el", "s1_dist", "s1_conf",
+                                    "s2_id", "s2_az", "s2_el", "s2_dist", "s2_conf"])
+        self.w["groups"].writerow(["pc_time_s", "frame",
+                                   "G_az", "G_el", "G_cos_el", "G_closure_us", "G_sigma_deg", "G_peak", "G_ok",
+                                   "R_az", "R_el", "R_cos_el", "R_closure_us", "R_sigma_deg", "R_peak", "R_ok",
+                                   "match_deg", "match_frames", "match_spread_deg"])
+        g = loc.geometry
+        with open(self.folder / "info.txt", "w", encoding="utf-8") as f:
+            f.write(f"created {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"algorithms {''.join(loc.algs)}\ntracker {loc.track_mode}\nvad {loc.vad_mode}\n")
+            f.write(f"geometry {loc.geometry_src}\nc {g.c}\nfs {g.fs}\n")
+            f.write(f"group_offset {loc.fixed_offset}\n")
+            for m in range(6):
+                f.write(f"M{m + 1} " + " ".join(f"{v * 1000:.1f}" for v in g.mics_m[m]) + " mm\n")
+        self.rows = 0
+        self.last_flush = time.monotonic()
+
+    def write(self, kind, row):
+        with self.lock:
+            if not self.f:
+                return
+            self.w[kind].writerow([f"{time.time():.3f}"] + [_fmt(v) for v in row])
+            self.rows += 1
+            if time.monotonic() - self.last_flush > 1.0:
+                for f in self.f.values():
+                    f.flush()
+                self.last_flush = time.monotonic()
+
+    def close(self):
+        with self.lock:
+            for f in self.f.values():
+                f.close()
+            self.f = {}
+
+
+def _fmt(v):
+    if v is None:
+        return ""
+    if isinstance(v, (bool, np.bool_)):
+        return int(v)
+    if isinstance(v, (float, np.floating)):
+        return f"{v:.3f}"
+    return v
+
+
+def _src_cols(sources):
+    out = []
+    for k in range(2):
+        out += list(sources[k]) if k < len(sources) else [None] * 4
+    return out
+
+
+def _track_cols(tracks):
+    out = [len(tracks)]
+    for k in range(2):
+        out += [tracks[k].id, tracks[k].az_deg, tracks[k].el_deg, tracks[k].dist_m, tracks[k].confidence] \
+            if k < len(tracks) else [None] * 5
+    return out
+
+
 class PcLocalizer:
     def __init__(self, sim_path=None, config_h=None, track_mode="AZ", algs="GRH", group_offset=None, vad="steady"):
         self.sim_path = find_daq_sim(sim_path)
@@ -178,6 +261,7 @@ class PcLocalizer:
             raise ValueError("vad must be 'steady' or 'device'")
         self.vad_mode = vad
         self.energy_hist = collections.deque(maxlen=STEADY_VAD_WINDOW)
+        self.log = None                                        # SessionLog while logging
         self._rebuild = None                       # (geometry, source name): rebuild in the worker
         self._build()
         self.main_thread = threading.Thread(target=self._run, daemon=True)
@@ -272,6 +356,8 @@ class PcLocalizer:
                 # ~6 s; here the floor is the quietest frame of the last ~30 s, so a steady source stays on
                 self.energy_hist.append(r.energy_db)
                 r.voice = r.energy_db > min(self.energy_hist) + VAD_MARGIN_DB
+            if self.log:
+                self.log.write("frames", [frame, r.voice, r.energy_db] + list(r.tau_s * 1e6) + list(r.peak))
             if any(a in self.algs for a in "GRH"):
                 self._groups(r)
             if "A" in self.algs:
@@ -292,6 +378,9 @@ class PcLocalizer:
 
     def _publish(self, alg, r, kind, sources, ms, computed=True, residual=None):
         tracks = self.trackers[alg].update(r.frame if r is not None else None, sources)
+        if self.log and r is not None:
+            self.log.write("results", [r.frame, alg, r.voice, computed, kind, len(sources)] + _src_cols(sources)
+                           + [residual, ms] + _track_cols(tracks))
         with self.lock:
             s = self.state[alg]
             s.frames += 1
@@ -349,6 +438,10 @@ class PcLocalizer:
         if g["ok"] and a["ok"]:
             self.match.append(wrap180(a["az"] - g["az"]))
         off = self.match_offset()
+        if self.log:
+            self.log.write("groups", [r.frame] + [d[k] for d in (g, a) for k in
+                                                  ("az", "el", "cos_el", "closure_us", "sigma_deg", "peak", "ok")]
+                           + (list(off) if off else [None] * 3))
         ms = (time.perf_counter() - t0) * 1000
         for key, d in (("G", g), ("R", a)):
             if key in self.algs:
@@ -447,6 +540,9 @@ class PcLocalizer:
 
     def _publish_b(self, frame, voice, sources, ms, computed, kind="-"):
         tracks = self.trackers["B"].update(frame, sources)
+        if self.log:
+            self.log.write("results", [frame, "B", voice, computed, kind, len(sources)] + _src_cols(sources)
+                           + [None, ms] + _track_cols(tracks))
         with self.lock:
             s = self.state["B"]
             s.frames += 1
@@ -492,7 +588,20 @@ class PcLocalizer:
             if self._rebuild is None:
                 self._rebuild = (self.geometry, self.geometry_src)   # trackers restart in the worker thread
 
+    def start_log(self, folder):
+        self.stop_log()
+        self.log = SessionLog(folder, self)
+        return str(self.log.folder)
+
+    def stop_log(self):
+        log, self.log = self.log, None
+        if log:
+            log.close()
+            return log.rows
+        return 0
+
     def close(self):
+        self.stop_log()
         self.running = False
         with self.b_cond:
             self.b_cond.notify_all()
@@ -612,6 +721,7 @@ def main():
     ap.add_argument("--track", default="AZ")
     ap.add_argument("--group-offset", type=float)
     ap.add_argument("--vad", default="steady", choices=["steady", "device"])
+    ap.add_argument("--log", help="write the session logs (frames/results/groups.csv) to this folder")
     args = ap.parse_args()
     p = Path(args.rec)
     ch = []
@@ -621,6 +731,8 @@ def main():
     n = min(len(c) for c in ch)
     x = np.stack([c[:n] for c in ch], axis=1)
     loc = PcLocalizer(args.sim, args.config, args.track.upper(), args.pc_alg, args.group_offset, args.vad)
+    if args.log:
+        loc.start_log(args.log)
     per_frame = []
     orig = loc._publish
 
