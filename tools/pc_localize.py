@@ -73,6 +73,9 @@ def circ_mean(deg, w=None):
 def wrap180(d):
     return (d + 180.0) % 360.0 - 180.0
 SHOW_S = 1.0                 # a frame result is shown for this long after the frame
+HISTORY_S = 3.0              # earlier results stay on the radar as dots for this long
+STEADY_VAD_WINDOW = 940      # frames (~30 s): steady VAD floor = minimum band energy over this window
+VAD_MARGIN_DB = 9.0          # same margin as the device
 B_IN_FLIGHT = 2              # SRP-PHAT frames queued / running in the B process
 
 
@@ -132,10 +135,11 @@ class AlgState:
     sources: list = field(default_factory=list)   # (az, el, dist, conf)
     tracks: list = field(default_factory=list)    # (id, az, el, dist, conf)
     residual_us: float = None
+    history: collections.deque = field(default_factory=lambda: collections.deque(maxlen=400))   # (t, az)
 
 
 class PcLocalizer:
-    def __init__(self, sim_path=None, config_h=None, track_mode="AZ", algs="GRH", group_offset=None):
+    def __init__(self, sim_path=None, config_h=None, track_mode="AZ", algs="GRH", group_offset=None, vad="steady"):
         self.sim_path = find_daq_sim(sim_path)
         from daq_sim.geometry import load_geometry
         from daq_sim.track import MODES
@@ -170,6 +174,10 @@ class PcLocalizer:
         self.state = {a: AlgState(a) for a in ALGS}
         self.match = collections.deque(maxlen=MATCH_FRAMES)   # az(arms) - az(body), frames with both valid
         self.fixed_offset = group_offset                       # --group-offset: no matching, use this rotation
+        if vad not in ("steady", "device"):
+            raise ValueError("vad must be 'steady' or 'device'")
+        self.vad_mode = vad
+        self.energy_hist = collections.deque(maxlen=STEADY_VAD_WINDOW)
         self._rebuild = None                       # (geometry, source name): rebuild in the worker
         self._build()
         self.main_thread = threading.Thread(target=self._run, daemon=True)
@@ -259,6 +267,11 @@ class PcLocalizer:
             r = self.est.process(self.buf[:FRAME_LEN], frame)
             self.buf = self.buf[HOP:]
             self.buf_start += HOP
+            if self.vad_mode == "steady":
+                # device VAD: the floor rises 0.05 dB per frame, so a steady sound stops being "voice" after
+                # ~6 s; here the floor is the quietest frame of the last ~30 s, so a steady source stays on
+                self.energy_hist.append(r.energy_db)
+                r.voice = r.energy_db > min(self.energy_hist) + VAD_MARGIN_DB
             if any(a in self.algs for a in "GRH"):
                 self._groups(r)
             if "A" in self.algs:
@@ -292,6 +305,7 @@ class PcLocalizer:
                         s.with_result += 1
                         s.kind, s.sources, s.residual_us = kind, list(sources), residual
                         s.last_frame, s.last_t = r.frame, time.monotonic()
+                        s.history.extend((s.last_t, src[0]) for src in sources)
             s.tracks = [(t.id, t.az_deg, t.el_deg, t.dist_m, t.confidence) for t in tracks]
 
     def _group(self, key, r):
@@ -300,6 +314,19 @@ class PcLocalizer:
         # angular accuracy ~ timing error / aperture (rad -> deg)
         d["sigma_deg"] = float(np.degrees(max(abs(d["closure_us"]), CLOSURE_FLOOR_US[key]) / d["aperture_us"]))
         return d
+
+    def mic_layout(self, alg):
+        """(label, az, radius fraction) of the mics drawn on this algorithm's radar, from the geometry in use.
+        Radius to scale with the farthest mic at 0.55; the small body triangle is drawn at >= 0.16 (enlarged)."""
+        m = self.geometry.mics_m
+        show = {"G": (0, 1, 2), "R": (3, 4, 5)}.get(alg, range(6))
+        rmax = max(float(np.hypot(*m[i][:2])) for i in range(6)) or 1.0
+        out = []
+        for i in show:
+            r = float(np.hypot(*m[i][:2]))
+            az = float(np.degrees(np.arctan2(m[i][1], m[i][0])) % 360.0)
+            out.append((str(i + 1), az, max(0.55 * r / rmax, 0.16)))
+        return out
 
     def match_offset(self):
         """Rotation of the arms group relative to the body: (offset deg, frames, spread deg) or None."""
@@ -433,6 +460,7 @@ class PcLocalizer:
                         s.with_result += 1
                         s.kind, s.sources, s.residual_us = kind, list(sources), None
                         s.last_frame, s.last_t = frame, time.monotonic()
+                        s.history.extend((s.last_t, src[0]) for src in sources)
             s.tracks = [(t.id, t.az_deg, t.el_deg, t.dist_m, t.confidence) for t in tracks]
 
     # ------------------------------------------------------------------ output
@@ -447,9 +475,11 @@ class PcLocalizer:
                     name=ALG_NAMES[a], frames=s.frames, voice=s.voice, computed=s.computed,
                     with_result=s.with_result, avg_ms=(s.busy_s * 1000 / s.computed) if s.computed else 0.0,
                     last_ms=s.last_ms, kind=s.kind if fresh else "-", sources=list(s.sources) if fresh else [],
-                    tracks=list(s.tracks), residual_us=s.residual_us if fresh else None)
+                    tracks=list(s.tracks), residual_us=s.residual_us if fresh else None,
+                    history=[az for t, az in s.history if now - t <= HISTORY_S],
+                    mics=self.mic_layout(a))
             match = self.match_offset() if any(a in self.algs for a in "GRH") else None
-            return dict(algs=out, match=match, geometry=self.geometry_src, c=self.geometry.c, track_mode=self.track_mode,
+            return dict(algs=out, match=match, vad=self.vad_mode, geometry=self.geometry_src, c=self.geometry.c, track_mode=self.track_mode,
                         queue=self.q.qsize(), dropped=self.dropped_blocks, resets=self.resets,
                         error=self.error, enabled=self.enabled)
 
@@ -478,23 +508,28 @@ class PcLocalizer:
 
 # ---------------------------------------------------------------------- text rendering
 
-def radar(sources, tracks, w=31, h=15):
+def track_mark(tid):
+    return chr(ord("a") + (tid - 1) % 26)
+
+
+def radar(sources, tracks, history=(), mics=(), w=31, h=15):
     """ASCII top view: azimuth 0 to the right (x), 90 up (y), as in the array coordinates.
-    Ring = direction; arms M4 (150), M5 (270), M6 (30) marked 4 5 6 inside; frame sources '*',
-    confirmed tracks by their id digit (last digit). Returns a list of strings."""
-    grid = [[" "] * w for _ in range(h)]
+    Returns rows of (char, kind): kind ring | label | mic | centre | history | source | track.
+    Ring = direction; digits = mics (from the geometry; the small body triangle enlarged), '.' = results of the
+    last HISTORY_S seconds, '*' = last frame, letters = confirmed speaker tracks (a = #1, b = #2, ...)."""
+    grid = [[(" ", "")] * w for _ in range(h)]
     cx, cy = (w - 1) / 2, (h - 1) / 2
     rx, ry = cx - 1, cy - 1
 
-    def put(az, frac, ch):
+    def put(az, frac, ch, kind):
         a = np.radians(az)
         x = int(round(cx + frac * rx * np.cos(a)))
         y = int(round(cy - frac * ry * np.sin(a)))
         if 0 <= x < w and 0 <= y < h:
-            grid[y][x] = ch
+            grid[y][x] = (ch, kind)
 
-    for az in range(0, 360, 6):
-        put(az, 1.0, "·")
+    for az in range(0, 360, 4):
+        put(az, 1.0, "·", "ring")
     for az, label in ((0, "0"), (90, "90"), (180, "180"), (270, "270")):
         a = np.radians(az)
         x = int(round(cx + (rx + 0.5) * np.cos(a)))
@@ -503,15 +538,21 @@ def radar(sources, tracks, w=31, h=15):
         if az == 180:
             x = 0
         for i, c in enumerate(label):
-            grid[y][x + i] = c
-    for az, label in ((150, "4"), (270, "5"), (30, "6")):
-        put(az, 0.45, label)
-    grid[int(cy)][int(cx)] = "+"
+            grid[y][x + i] = (c, "label")
+    grid[int(cy)][int(cx)] = ("+", "centre")
+    for label, az, frac in mics:
+        put(az, frac, label, "mic")
+    for az in history:
+        put(az, 0.8, ".", "history")
     for az, el, dist, conf in sources:
-        put(az, 0.8, "*")
+        put(az, 0.8, "*", "source")
     for tid, az, el, dist, conf in tracks:
-        put(az, 1.0, str(tid % 10))
-    return ["".join(r) for r in grid]
+        put(az, 1.0, track_mark(tid), "track")
+    return grid
+
+
+def radar_text(*args, **kw):
+    return ["".join(c for c, _ in row) for row in radar(*args, **kw)]
 
 
 def fmt_source(az, el, dist, conf):
@@ -570,6 +611,7 @@ def main():
     ap.add_argument("--pc-alg", default="GRH")
     ap.add_argument("--track", default="AZ")
     ap.add_argument("--group-offset", type=float)
+    ap.add_argument("--vad", default="steady", choices=["steady", "device"])
     args = ap.parse_args()
     p = Path(args.rec)
     ch = []
@@ -578,7 +620,7 @@ def main():
             ch.append(np.frombuffer(w.readframes(w.getnframes()), "<i2"))
     n = min(len(c) for c in ch)
     x = np.stack([c[:n] for c in ch], axis=1)
-    loc = PcLocalizer(args.sim, args.config, args.track.upper(), args.pc_alg, args.group_offset)
+    loc = PcLocalizer(args.sim, args.config, args.track.upper(), args.pc_alg, args.group_offset, args.vad)
     per_frame = []
     orig = loc._publish
 

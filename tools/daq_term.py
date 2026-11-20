@@ -48,6 +48,82 @@ MAX_FRAMES = 4096
 MAX_CHANNELS = 16
 
 
+class MicCheck:
+    """Live per-mic health from the audio stream, judged over ~1 s windows.
+
+    NOISE  white noise over the whole band (spectral flatness 300 Hz-20 kHz > FLAT_NOISE) and loud
+           (> NOISE_MIN_DBFS): what an empty or floating PDM slot sounds like (the ESP decodes random bits:
+           flat spectrum up to 24 kHz, usually with a large DC offset). Real mics, also in a quiet room, have
+           a far from flat spectrum (0.0-0.1 on the recordings of this array, 0.98 for such noise).
+    DEAD   no signal (all samples ~constant)       CLIP  samples at full scale
+    DC     DC offset above DC_MAX (counts)          OK    none of these
+    """
+    NFFT = 2048
+    EVERY = 6                 # one spectrum every 6 packets (40 ms)
+    WINDOW = 25               # spectra per verdict (~1 s)
+    FLAT_NOISE = 0.5
+    NOISE_MIN_DBFS = -45.0
+    DC_MAX = 4000.0
+    DEAD_DBFS = -100.0
+
+    def __init__(self, ch, rate):
+        self.ch, self.rate = ch, rate
+        self.buf = np.zeros((self.NFFT, ch))
+        self.win = np.hanning(self.NFFT)[:, None]
+        f = np.fft.rfftfreq(self.NFFT, 1 / rate)
+        self.band = (f >= 300) & (f <= min(20000, rate / 2 - 1000))
+        self.reset()
+        self.status = ["…"] * ch
+        self.flatness = [None] * ch
+        self.dc = [None] * ch
+
+    def reset(self):
+        self.spec = np.zeros((self.NFFT // 2 + 1, self.ch))
+        self.nspec = 0
+        self.packets = 0
+        self.s1 = np.zeros(self.ch)
+        self.s2 = np.zeros(self.ch)
+        self.n = 0
+        self.peak = np.zeros(self.ch)
+
+    def add(self, x):
+        """x: (frames, ch) float32 samples of one packet."""
+        k = x.shape[0]
+        self.buf = np.concatenate([self.buf[k:], x]) if k < self.NFFT else x[-self.NFFT:]
+        self.s1 += x.sum(axis=0)
+        self.s2 += np.einsum("ij,ij->j", x, x)
+        self.n += k
+        self.peak = np.maximum(self.peak, np.abs(x).max(axis=0))
+        self.packets += 1
+        if self.packets % self.EVERY == 0:
+            seg = self.buf - self.buf.mean(axis=0)
+            self.spec += np.abs(np.fft.rfft(seg * self.win, axis=0)) ** 2
+            self.nspec += 1
+            if self.nspec >= self.WINDOW:
+                self._verdict()
+                self.reset()
+
+    def _verdict(self):
+        p = self.spec[self.band] + 1e-12
+        flat = np.exp(np.mean(np.log(p), axis=0)) / np.mean(p, axis=0)
+        mean = self.s1 / self.n
+        ac = np.sqrt(np.maximum(self.s2 / self.n - mean ** 2, 1e-6))
+        ac_db = 20 * np.log10(ac / 32768.0)
+        st = []
+        for c in range(self.ch):
+            if ac_db[c] < self.DEAD_DBFS:
+                st.append("DEAD")
+            elif flat[c] > self.FLAT_NOISE and ac_db[c] > self.NOISE_MIN_DBFS:
+                st.append("NOISE")
+            elif self.peak[c] >= 32767:
+                st.append("CLIP")
+            elif abs(mean[c]) > self.DC_MAX:
+                st.append("DC")
+            else:
+                st.append("OK")
+        self.status, self.flatness, self.dc = st, [float(v) for v in flat], [float(v) for v in mean]
+
+
 def open_port(name, baud):
     """Open without toggling DTR/RTS: on the DevKitC both ports would reset the ESP32-S3."""
     port = serial.serial_for_url(name, do_not_open=True, baudrate=baud, timeout=0.05)
@@ -95,8 +171,10 @@ class UsbStream:
             self.last_frames = 0
             self.fmt = None          # (sample_rate, channels, frames)
             self.sumsq = None
+            self.sum = None
             self.peak = None
             self.nsamp = 0
+            self.check = None
             self.rate_hist = collections.deque(maxlen=20)   # (t, bytes_total)
             self.det_lines = 0           # CSV lines received
             self.det_voice = 0
@@ -275,8 +353,10 @@ class UsbStream:
         if self.fmt != (rate, ch, frames) or self.sumsq is None:
             self.fmt = (rate, ch, frames)
             self.sumsq = np.zeros(ch)
+            self.sum = np.zeros(ch)
             self.peak = np.zeros(ch)
             self.nsamp = 0
+            self.check = MicCheck(ch, rate)
         gap = 0
         if self.last_seq is not None:
             gap = (seq - self.last_seq - 1) & 0xFFFFFFFF
@@ -296,6 +376,8 @@ class UsbStream:
             self.loc.feed(first_frame, rate, ch, pcm)
         x = pcm.astype(np.float32)
         self.sumsq += np.einsum("ij,ij->j", x, x)
+        self.sum += x.sum(axis=0)
+        self.check.add(x)
         self.peak = np.maximum(self.peak, np.abs(x).max(axis=0))
         self.nsamp += frames
 
@@ -314,11 +396,13 @@ class UsbStream:
             t_a, b_a = self.rate_hist[0]
             rate = (self.bytes_total - b_a) / (now - t_a) if now > t_a else 0.0
             if self.sumsq is not None and self.nsamp:
-                rms = np.sqrt(self.sumsq / self.nsamp)
+                mean = self.sum / self.nsamp
+                rms = np.sqrt(np.maximum(self.sumsq / self.nsamp - mean ** 2, 0))   # AC level (DC removed)
                 dbfs = 20 * np.log10(np.maximum(rms, 1e-3) / 32768.0)
                 pk = 20 * np.log10(np.maximum(self.peak, 1e-3) / 32768.0)
                 clip = self.peak >= 32767
                 self.sumsq[:] = 0
+                self.sum[:] = 0
                 self.peak[:] = 0
                 self.nsamp = 0
             else:
@@ -328,6 +412,7 @@ class UsbStream:
                 resyncs=self.resyncs, bad=self.bad_headers, jumps=self.frame_jumps,
                 seq=self.last_seq, first_frame=self.last_first_frame, fmt=self.fmt,
                 dbfs=dbfs, peak=pk, clip=clip, uptime=now - self.t0,
+                check=(list(self.check.status), list(self.check.flatness), list(self.check.dc)) if self.check else None,
                 wav=self.wav_name if self.wav else None,
                 det_lines=self.det_lines, det_voice=self.det_voice, det_gaps=self.det_gaps,
                 det_last=self.det_last, det_src=self.det_last_src,
@@ -513,13 +598,22 @@ def render(usb, uart, msg, args):
         lv.add_column("RMS dBFS", justify="right")
         lv.add_column("")
         lv.add_column("peak", justify="right")
+        lv.add_column("check")
+        lv.add_column("flat", justify="right")
+        lv.add_column("DC", justify="right")
         if s["dbfs"] is not None:
+            chk = s["check"] or (["…"] * len(s["dbfs"]), [None] * len(s["dbfs"]), [None] * len(s["dbfs"]))
             for i, (d, p, c) in enumerate(zip(s["dbfs"], s["peak"], s["clip"])):
-                style = "red" if c else ("green" if d > -70 else "dim")
+                st, fl, dc = chk[0][i], chk[1][i], chk[2][i]
+                style = "red" if c or st in ("NOISE", "DEAD") else ("green" if d > -70 else "dim")
+                st_style = {"OK": "bold green", "NOISE": "bold white on red", "DEAD": "bold white on red",
+                            "CLIP": "bold red", "DC": "bold yellow"}.get(st, "dim")
                 lv.add_row(f"M{i + 1}", f"{d:6.1f}", Text(level_bar(d), style=style),
-                           Text(f"{p:6.1f}" + (" CLIP" if c else ""), style="red bold" if c else ""))
+                           Text(f"{p:6.1f}" + (" CLIP" if c else ""), style="red bold" if c else ""),
+                           Text(f" {st} ", style=st_style), "" if fl is None else f"{fl:.2f}",
+                           "" if dc is None else f"{dc:+.0f}")
         else:
-            lv.add_row("—", "", Text("no data (press s)", style="dim"), "")
+            lv.add_row("—", "", Text("no data (press s)", style="dim"), "", "", "", "")
         title = f"USB {args.usb}"
         if s["error"]:
             title += f"  [red]{s['error']}[/red]"
@@ -548,7 +642,7 @@ def render_loc(snap):
     from rich.panel import Panel
     from rich.table import Table
     from rich.text import Text
-    from pc_localize import fmt_source, radar
+    from pc_localize import fmt_source, radar, track_mark
 
     grid = Table.grid(padding=(0, 3))
     cols = []
@@ -556,12 +650,11 @@ def render_loc(snap):
         grid.add_column()
         t = Text()
         t.append(f"{a}  {s['name']}\n", style="bold")
-        rad = radar(s["sources"], s["tracks"])
-        for line in rad:
-            for ch in line:
-                style = "bold yellow" if ch == "*" else ("bold green" if ch.isdigit() and ch not in "456" else
-                                                         ("cyan" if ch in "456+" else "dim"))
-                t.append(ch, style=style)
+        styles = {"ring": "dim", "label": "dim", "mic": "bold cyan", "centre": "cyan", "history": "yellow",
+                  "source": "bold yellow", "track": "bold green", "": ""}
+        for row in radar(s["sources"], s["tracks"], s["history"], s["mics"]):
+            for ch, kind in row:
+                t.append(ch, style=styles[kind])
             t.append("\n")
         kind = {"P": "position", "D": "direction only", "-": "no result"}[s["kind"]]
         t.append(f"frame: {kind}\n", style="bold" if s["sources"] else "dim")
@@ -572,7 +665,7 @@ def render_loc(snap):
             t.append(f"  {label} {s['residual_us']:.1f} us\n", style="dim")
         t.append(f"speakers: {len(s['tracks'])}\n", style="bold green" if s["tracks"] else "dim")
         for tid, az, el, dist, conf in s["tracks"][:3]:
-            t.append(f"  #{tid} " + fmt_source(az, el, dist, conf) + "\n", style="green")
+            t.append(f"  {track_mark(tid)} #{tid} " + fmt_source(az, el, dist, conf) + "\n", style="green")
         pct = 100 * s["computed"] / s["voice"] if s["voice"] else 100
         t.append(f"{s['avg_ms']:.1f} ms/frame  voice {s['voice']}  done {pct:.0f}%  results {s['with_result']}",
                  style="dim" if pct >= 99 else "yellow")
@@ -590,7 +683,8 @@ def render_loc(snap):
             f"queue {snap['queue']}  dropped {snap['dropped']}  restarts {snap['resets']}")
     if not snap["enabled"]:
         info += "  [OFF, p = on]"
-    title = "PC localization (daq-sim)  ·  * frame source, digit = speaker track, 4 5 6 = arms"
+    title = ("PC localization  ·  1-6 mics (M1-M3 enlarged)  * last frame  . last 3 s  a b = speakers"
+             + ("" if snap.get("vad") != "steady" else "  ·  VAD steady"))
     if snap["error"]:
         title += f"  [red]{snap['error']}[/red]"
     from rich.console import Group
@@ -609,6 +703,8 @@ def run_plain(usb, uart, args):
             print(f"usb {s['rate'] / 1000:7.1f} kB/s pk={s['packets']} lost={s['lost']} "
                   f"resync={s['resyncs']} bad={s['bad']} jumps={s['jumps']} seq={s['seq']} dBFS {lv}",
                   flush=True)
+            if s["check"]:
+                print("mic " + " ".join(f"M{i + 1}:{st}" for i, st in enumerate(s["check"][0])), flush=True)
             print("det", det_summary(s), flush=True)
             if usb.loc:
                 from pc_localize import plain_line
@@ -633,6 +729,10 @@ def main():
     ap.add_argument("--pc-alg", default="GRH",
                     help="algorithms on the PC: A, B, C (whole array, need the full geometry), G (group M1-M3), "
                          "R (group M4-M6), H (hybrid of G and R); default GRH")
+    ap.add_argument("--vad", default="steady", choices=["steady", "device"],
+                    help="PC voice detection: steady = floor is the quietest frame of the last 30 s (a steady source "
+                         "stays detected), device = the firmware rule (floor rises 0.05 dB/frame, a steady sound fades "
+                         "out after ~6 s)")
     ap.add_argument("--group-offset", type=float, help="rotation of the M4-M6 group relative to M1-M3 in degrees "
                                                        "(default: matched from the data)")
     ap.add_argument("--config", help="config.h with the default geometry (default: main/config.h); "
@@ -657,7 +757,7 @@ def main():
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         try:
             from pc_localize import PcLocalizer
-            usb.loc = PcLocalizer(args.sim, args.config, args.track, args.pc_alg, args.group_offset)
+            usb.loc = PcLocalizer(args.sim, args.config, args.track, args.pc_alg, args.group_offset, args.vad)
             loc_msg = f"PC localization: daq-sim from {usb.loc.sim_path}"
         except ImportError as e:
             loc_msg = f"PC localization off: {e}"

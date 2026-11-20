@@ -456,6 +456,12 @@ python tools/daq_term.py --uart COM3 --usb COM4 --csv                    # detec
 python tools/daq_term.py --uart "" --usb COM4 --plain --csv --duration 60   # 60 s, no UI
 ``` Run it with the Windows Python (PowerShell), not from WSL: WSL does not see `COMx` ports.
 
+**Mic check** (always on): next to each level, `check` judges every mic over ~1 s windows: `NOISE` = white noise over the whole
+band (spectral flatness 300 Hz–20 kHz > 0.5) and louder than −45 dBFS, the sound of an empty or floating PDM slot (the ESP
+decodes random bits: flat up to 24 kHz, usually with a large DC offset); `DEAD` = no signal; `CLIP` = full scale; `DC` = DC
+offset above 4000 counts; `OK` otherwise. `flat` and `DC` show the values. Real mics stay far below the flatness limit
+(0.04–0.14 in a quiet room, ~0 with speech or music, 0.96 for the noise of a floating slot). The levels are now AC (DC removed).
+
 **PC localization** (`tools/pc_localize.py`, used by `daq_term.py`): the PC runs algorithms **A, B and C at the same
 time** on the streamed audio and shows one radar per algorithm (top view, azimuth 0 to the right, 90 up; `*` = source
 of the last frame, digit = confirmed speaker track, `4 5 6` = the arms) with the frame result, the speakers and the time
@@ -479,7 +485,10 @@ is rotated: the panel shows the running difference `az(M4–M6) − az(M1–M3)`
 (closure |τab − τac + τbc| ≤ 25 µs for M1–M3, ≤ 80 µs for M4–M6) as the rotation of the arms group (`--group-offset DEG` fixes it).
 The hybrid rotates the arms direction into the body frame and averages both, weighted by aperture and closure error; if they
 still differ by more than 30° it keeps the more accurate one. `A`, `B`, `C` use the whole array and need the full geometry.
-Offline, the same code on a recording: `python tools/pc_localize.py recordings/usb_… [--pc-alg GRHABC]` (summary per algorithm
+The radars draw the mics from the geometry in use (M1–M3 enlarged, otherwise they would be one dot), `*` = last frame,
+`.` = results of the last 3 s, letters = confirmed speakers (`a` = track #1). `--vad steady` (default) keeps a steady source
+detected (VAD floor = quietest frame of the last 30 s); `--vad device` uses the firmware rule, with which a steady sound stops
+counting as voice after ~6 s. Offline, the same code on a recording: `python tools/pc_localize.py recordings/usb_… [--pc-alg GRHABC]` (summary per algorithm
 and the matched rotation).
 
 Options: `--sim PATH` (folder with `daq_sim/`, default: `../daq-simulator`, `../daq-sim` or `$DAQ_SIM`), `--track AZ|AZEL|ELLIPSE`,
