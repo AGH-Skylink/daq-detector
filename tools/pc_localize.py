@@ -43,8 +43,10 @@ K_NOISE_DEG = {"B": 6.9, "R": 7.7, "G": 14.3, "A": 6.0}   # robust error of each
 K_Q = 6400.0                 # acceleration noise, (deg/s^2)^2: allows a person walking around the array
 K_GATE_SIGMA, K_GATE_MIN_DEG = 3.5, 20.0
 K_REACQUIRE = 5              # frames in a row outside the gate that agree with each other -> jump to them
-K_HOLD_S = 0.8               # keep showing the estimate this long without accepted measurements
-K_RESET_S = 3.0              # forget the source after this long
+K_HOLD_S = 0.8               # the estimate counts as current this long without accepted measurements; after that it
+                             # is still shown, greyed, as "held" (last known direction, no sound to localize)
+K_RESET_S = 3.0              # after this long without measurements the next measurement starts the filter afresh
+                             # (no gate: the source may have moved anywhere during the silence)
 K_MAX_SPEED_DPS = 90.0       # azimuth speed limit (a person walking around at ~1 m)
 K_COAST_DAMP = 0.7           # per frame without an accepted measurement the speed is multiplied by this, so the
                              # estimate does not keep sweeping round while it is held
@@ -61,7 +63,10 @@ class AzKalman:
         self.pending = []
 
     def step(self, meas):
-        """meas: list of (az_deg, el_deg, sigma_deg). Returns (az, el) or None (nothing to show)."""
+        """meas: list of (az_deg, el_deg, sigma_deg). Returns (az, el, age_s) - age = time since the last accepted
+        measurement - or None before the first measurement."""
+        if meas and self.x is not None and self.since * self.dt > K_RESET_S:
+            self.x = None                                   # long silence: start afresh on this measurement
         if self.x is not None:
             self.x = self.F @ self.x
             self.P = self.F @ self.P @ self.F.T + self.Q
@@ -97,11 +102,9 @@ class AzKalman:
             self.x[1] = float(np.clip(self.x[1], -K_MAX_SPEED_DPS, K_MAX_SPEED_DPS))
         if self.x is None:
             return None
-        if self.since * self.dt > K_RESET_S:
-            self.x = None
-            self.pending = []
-            return None
-        return (float(self.x[0]), float(self.el)) if self.since * self.dt <= K_HOLD_S else None
+        if self.since * self.dt > K_HOLD_S:
+            self.x[1] = 0.0                                 # held: the direction stays where it was
+        return float(self.x[0]), float(self.el), self.since * self.dt
 
     def _start(self, meas, az=None):
         best = min(meas, key=lambda m: m[2])
@@ -340,6 +343,7 @@ class PcLocalizer:
         self.energy_hist = collections.deque(maxlen=STEADY_VAD_WINDOW)
         self.log = None                                        # SessionLog while logging
         self.kalman = AzKalman(1536 / 48000)
+        self.k_held = None                                     # (az, el, age_s) while K holds the last direction
         self.k_meas = {}                                       # frame -> (voice, measurements) waiting for B
         self._grp = None                                       # (G, R) of the current frame
         self._rebuild = None                       # (geometry, source name): rebuild in the worker
@@ -645,12 +649,20 @@ class PcLocalizer:
     def _k_step(self, frame, voice, meas):
         t0 = time.perf_counter()
         est = self.kalman.step(meas)
-        src = [(est[0], est[1], 0.0, 1.0)] if est else []
+        fresh = est is not None and est[2] <= K_HOLD_S
+        src = [(est[0], est[1], 0.0, 1.0)] if fresh else []
+        with self.lock:
+            self.k_held = (est[0], est[1], est[2]) if est is not None and not fresh else None
+        if self.log and est is not None and not fresh:
+            self.log.write("results", [frame, "K", voice, False, "h", 1, est[0], est[1], 0.0, 0.0] + [None] * 4
+                           + [None, 0.0, 0] + [None] * 10)
+            self._publish_b(frame, voice, [], 0.0, True, "-", alg="K", log=False)
+            return
         self._publish_b(frame, voice, src, (time.perf_counter() - t0) * 1000, True, "D" if src else "-", alg="K")
 
-    def _publish_b(self, frame, voice, sources, ms, computed, kind="-", alg="B"):
+    def _publish_b(self, frame, voice, sources, ms, computed, kind="-", alg="B", log=True):
         tracks = self.trackers[alg].update(frame, sources)
-        if self.log:
+        if self.log and log:
             self.log.write("results", [frame, alg, voice, computed, kind, len(sources)] + _src_cols(sources)
                            + [None, ms] + _track_cols(tracks))
         with self.lock:
@@ -683,6 +695,7 @@ class PcLocalizer:
                     last_ms=s.last_ms, kind=s.kind if fresh else "-", sources=list(s.sources) if fresh else [],
                     tracks=list(s.tracks), residual_us=s.residual_us if fresh else None,
                     history=[az for t, az in s.history if now - t <= HISTORY_S],
+                    held=self.k_held if a == "K" and not fresh else None,
                     mics=self.mic_layout(a))
             match = self.match_offset() if any(a in self.algs for a in "GRH") else None
             return dict(algs=out, match=match, vad=self.vad_mode, geometry=self.geometry_src, c=self.geometry.c, track_mode=self.track_mode,
@@ -731,7 +744,7 @@ def track_mark(tid):
     return chr(ord("a") + (tid - 1) % 26)
 
 
-def radar(sources, tracks, history=(), mics=(), w=31, h=15):
+def radar(sources, tracks, history=(), mics=(), w=31, h=15, held=None):
     """ASCII top view: azimuth 0 to the right (x), 90 up (y), as in the array coordinates.
     Returns rows of (char, kind): kind ring | label | mic | centre | history | source | track.
     Ring = direction; digits = mics (from the geometry; the small body triangle enlarged), '.' = results of the
@@ -763,6 +776,8 @@ def radar(sources, tracks, history=(), mics=(), w=31, h=15):
         put(az, frac, label, "mic")
     for az in history:
         put(az, 0.8, ".", "history")
+    if held:
+        put(held[0], 0.8, "o", "held")
     for az, el, dist, conf in sources:
         put(az, 0.8, "*", "source")
     for tid, az, el, dist, conf in tracks:

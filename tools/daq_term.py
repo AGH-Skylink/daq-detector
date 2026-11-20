@@ -673,13 +673,16 @@ def render_loc(snap, show=None):
         t = Text()
         t.append(f"{a}  {s['name']}\n", style="bold")
         styles = {"ring": "dim", "label": "dim", "mic": "bold cyan", "centre": "cyan", "history": "yellow",
-                  "source": "bold yellow", "track": "bold green", "": ""}
-        for row in radar(s["sources"], s["tracks"], s["history"], s["mics"]):
+                  "source": "bold yellow", "track": "bold green", "held": "white", "": ""}
+        for row in radar(s["sources"], s["tracks"], s["history"], s["mics"], held=s.get("held")):
             for ch, kind in row:
                 t.append(ch, style=styles[kind])
             t.append("\n")
         kind = {"P": "position", "D": "direction only", "-": "no result"}[s["kind"]]
-        t.append(f"frame: {kind}\n", style="bold" if s["sources"] else "dim")
+        if s.get("held"):
+            t.append(f"held: az {s['held'][0]:5.1f}  (no sound for {s['held'][2]:.1f} s)\n", style="white")
+        else:
+            t.append(f"frame: {kind}\n", style="bold" if s["sources"] else "dim")
         for src in s["sources"][:2]:
             t.append("  " + fmt_source(*src) + "\n", style="yellow")
         if s["residual_us"] is not None:
@@ -705,7 +708,7 @@ def render_loc(snap, show=None):
             f"queue {snap['queue']}  dropped {snap['dropped']}  restarts {snap['resets']}")
     if not snap["enabled"]:
         info += "  [OFF, p = on]"
-    title = ("PC localization  ·  1-6 mics (M1-M3 enlarged)  * last frame  . last 3 s  a b = speakers"
+    title = ("PC localization  ·  1-6 mics (M1-M3 enlarged)  * last frame  . last 3 s  o held (silence)  a b = speakers"
              + ("" if snap.get("vad") != "steady" else "  ·  VAD steady"))
     if snap["error"]:
         title += f"  [red]{snap['error']}[/red]"
