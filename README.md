@@ -364,8 +364,8 @@ Modes (console `trk N`, BLE `0A nn`, stored in NVS; a change restarts the tracke
 Host check: C replay identical to Python in all three modes (same counts and ids in every frame).
 
 ### `main/main.c`
-- `app_main()` initialises settings/NVS, storage (continues without SD if the card is missing), the USB stream, the capture, BLE (continues without it) and the system task, then starts the UI task.
-- `ui_task` (core 0, priority 3) polls the UART console and the button every 20 ms and prints the status line.
+- `app_main()` initialises settings/NVS, storage, the USB stream, the DSP, the capture, BLE and the system task, then starts the UI task. Only a settings/NVS or system task failure is fatal; the other init results are kept for the self-test.
+- `ui_task` (core 0, priority 3) runs the self-test once after start, then polls the UART console and the button every 20 ms and prints the status line.
 
 Console keys (act immediately): `r` start/stop SD recording, `u` start/stop USB stream, `i` identify, `h` help. The button on GPIO16 also toggles recording.
 
@@ -381,6 +381,28 @@ Console line commands (typed with echo, end with Enter), saved to NVS immediatel
 | `out` / `out 1` | show / set BLE outputs: 1 tracked Result, 2 Raw result, 3 both, 0 none |
 | `defaults` | restore all settings from `config.h` |
 | `play N` | replay `RECnnnnn.WAV` through the DSP → `PLYnnnnn.CSV` (not while recording); progress in the status line |
+| `diag` | run the self-test again (see below) |
+
+**Self-test.** About 1.5 s after boot (and on `diag`) the console prints a report, one `DIAG OK|WARN|FAIL <item> …` line per check
+and a final `DIAG result OK|FAIL (n fail, m warn)`. Takes ~0.5 s. Checks: reset reason (brownout / panic / watchdog = WARN),
+PSRAM size, capture rate (frames in 0.5 s vs `fs / 2`, FAIL = no PDM clock or I2S not running), DMA overflows, level of each mic
+(FAIL below −100 dBFS = no signal, above −10 dBFS = stuck / clipping data line; thresholds `DIAG_LEVEL_*` in `main.c`, tune on
+the device), DSP frame time and FFT convention, SD card (mounted, free space, write errors), INA219 and battery voltage, LED,
+USB stream, BLE. Init errors of SD, USB, DSP, capture and BLE no longer reboot the board: they are kept in `g_daq.*_init_err`
+and shown as FAIL. Not covered: swapped mic order (`DAQ_CHANNEL_MAP`), use the tap test.
+
+```
+DIAG begin fw 0.8.0
+DIAG OK   reset   power-on
+DIAG OK   psram   8192 kB, free internal 210 kB
+DIAG OK   capture 24000 frames / 0.5 s (expected 24000)
+DIAG OK   dma     overflows 0 (+0 during test)
+DIAG OK   M1       -61.3 dBFS
+DIAG FAIL M5      -120.0 dBFS - no signal (check 3V/GND/DAT wire, SEL GPIO 14)
+…
+DIAG WARN battery INA219 not found at 0x43 (SDA GPIO 1, SCL GPIO 2)
+DIAG result FAIL (1 fail, 1 warn)
+```
 
 Status line example:
 ```

@@ -50,6 +50,9 @@ typedef struct {
     volatile uint64_t loc_frame;          /* frame of the last valid position */
     volatile uint8_t  trk_count;          /* confirmed tracks (speakers) after the last frame */
     volatile float    trk_az_deg;         /* direction of the most confident track */
+    /* self-test (main.c): init results from app_main, shown by the DIAG report */
+    volatile esp_err_t sd_init_err, stream_init_err, dsp_init_err, capture_init_err, ble_init_err;
+    volatile bool     diag_failed;        /* last self-test had at least one FAIL */
 } daq_state_t;
 
 extern daq_state_t g_daq;
@@ -161,6 +164,7 @@ esp_err_t dsp_start(void);
 void dsp_push(const int16_t *block, uint64_t first_frame);   /* called by capture_task for every block */
 esp_err_t dsp_replay_start(int index);                       /* RECnnnnn.WAV -> PLYnnnnn.CSV */
 bool dsp_replay_running(void);
+bool dsp_fft_mirrored(void);   /* FFT sign convention found at start (self-test report) */
 int dsp_csv_header(char *buf, size_t size, const char *wav_name, uint64_t first_frame);
 
 /* localize.c — algorithms A and B (reference: daq-sim/daq_sim/ls.py, srp.py) */

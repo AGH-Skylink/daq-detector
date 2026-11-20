@@ -578,6 +578,11 @@ static void fft_self_test(void)
     ESP_LOGI(TAG, "FFT convention %s", s_fft_mirrored ? "e^{+j} (mirrored)" : "e^{-j}");
 }
 
+bool dsp_fft_mirrored(void)
+{
+    return s_fft_mirrored;
+}
+
 esp_err_t dsp_start(void)
 {
     s_k_lo = (int)ceilf(BAND_LO_HZ * N / DAQ_SAMPLE_RATE_HZ);
