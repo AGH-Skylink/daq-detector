@@ -51,7 +51,7 @@ typedef struct {
     volatile uint8_t  trk_count;          /* confirmed tracks (speakers) after the last frame */
     volatile float    trk_az_deg;         /* direction of the most confident track */
     /* self-test (main.c): init results from app_main, shown by the DIAG report */
-    volatile esp_err_t sd_init_err, stream_init_err, dsp_init_err, capture_init_err, ble_init_err;
+    volatile esp_err_t sd_init_err, stream_init_err, dsp_init_err, capture_init_err, ble_init_err, system_init_err;
     volatile bool     diag_failed;        /* last self-test had at least one FAIL */
 } daq_state_t;
 

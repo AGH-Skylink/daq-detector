@@ -88,8 +88,12 @@ static esp_err_t sd_mount(void)
         .max_files = 4,   /* WAV + CSV while recording, WAV + CSV in replay */
         .allocation_unit_size = 32 * 1024,
     };
-    ESP_RETURN_ON_ERROR(esp_vfs_fat_sdspi_mount(DAQ_SD_MOUNT_POINT, &host, &slot, &mount_cfg, &s_card),
-                        TAG, "mount");
+    esp_err_t err = esp_vfs_fat_sdspi_mount(DAQ_SD_MOUNT_POINT, &host, &slot, &mount_cfg, &s_card);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "mount: %s", esp_err_to_name(err));
+        spi_bus_free(SPI2_HOST);   /* release the bus and its DMA memory */
+        return err;
+    }
     sdmmc_card_print_info(stdout, s_card);
     return ESP_OK;
 }
@@ -259,7 +263,14 @@ esp_err_t storage_init(void)
     }
     s_csv_ring = xStreamBufferCreateStatic(DAQ_SD_CSV_RING_BYTES, 1, csv_mem, &s_csv_ring_struct);
 
-    ESP_RETURN_ON_ERROR(sd_mount(), TAG, "sd_mount");
+    esp_err_t err = sd_mount();
+    if (err != ESP_OK) {
+        /* No card: give the 32 kB DMA chunk back to internal RAM, the other tasks need it.
+         * The PSRAM rings stay (unused: nothing is pushed while sd_ready is false). */
+        heap_caps_free(s_chunk);
+        s_chunk = NULL;
+        return err;
+    }
     g_daq.sd_ready = true;
 
     BaseType_t ok = xTaskCreatePinnedToCore(storage_task, "storage", 4096, NULL, 5, NULL, 0);

@@ -211,7 +211,12 @@ static esp_err_t battery_init(void)
     };
     i2c_master_bus_handle_t bus;
     ESP_RETURN_ON_ERROR(i2c_new_master_bus(&bus_cfg, &bus), TAG, "i2c bus");
-    ESP_RETURN_ON_ERROR(i2c_master_probe(bus, DAQ_INA219_ADDR, 50), TAG, "INA219 not found at 0x%02x", DAQ_INA219_ADDR);
+    esp_err_t err = i2c_master_probe(bus, DAQ_INA219_ADDR, 50);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "INA219 not found at 0x%02x", DAQ_INA219_ADDR);
+        i2c_del_master_bus(bus);
+        return err;
+    }
 
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,

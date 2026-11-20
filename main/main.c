@@ -15,6 +15,13 @@
 
 static const char *TAG = "main";
 
+static void log_heap(const char *step)
+{
+    ESP_LOGI(TAG, "after %-8s internal free %u kB, largest block %u kB", step,
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+             (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
+}
+
 daq_state_t g_daq;
 
 static void toggle_recording(void)
@@ -187,6 +194,8 @@ static void run_diag(void)
 
     diag(g_daq.led_present ? DIAG_OK : DIAG_WARN, "led", g_daq.led_present ? "ok" : "not available");
     diag(g_daq.stream_init_err == ESP_OK ? DIAG_OK : DIAG_FAIL, "usb", "%s", esp_err_to_name(g_daq.stream_init_err));
+    diag(g_daq.system_init_err == ESP_OK ? DIAG_OK : DIAG_FAIL, "system", "%s (battery, LED, CPU load)",
+         esp_err_to_name(g_daq.system_init_err));
     diag(g_daq.ble_init_err == ESP_OK ? DIAG_OK : DIAG_WARN, "ble", "%s%s", esp_err_to_name(g_daq.ble_init_err),
          g_daq.ble_connected ? ", phone connected" : "");
 
@@ -367,22 +376,33 @@ void app_main(void)
     if (g_daq.sd_init_err != ESP_OK) {
         ESP_LOGW(TAG, "SD card not available, recording disabled");
     }
+    log_heap("storage");
     g_daq.stream_init_err = stream_init();
     if (g_daq.stream_init_err != ESP_OK) {
         ESP_LOGE(TAG, "USB stream not available: %s", esp_err_to_name(g_daq.stream_init_err));
     }
+    log_heap("stream");
     g_daq.dsp_init_err = dsp_start();   /* before capture, so no block is lost */
     if (g_daq.dsp_init_err != ESP_OK) {
         ESP_LOGE(TAG, "DSP not available: %s", esp_err_to_name(g_daq.dsp_init_err));
     }
+    log_heap("dsp");
     g_daq.capture_init_err = capture_start();
     if (g_daq.capture_init_err != ESP_OK) {
         ESP_LOGE(TAG, "capture not available: %s", esp_err_to_name(g_daq.capture_init_err));
     }
+    log_heap("capture");
     g_daq.ble_init_err = ble_init();
     if (g_daq.ble_init_err != ESP_OK) {
         ESP_LOGW(TAG, "BLE not available");
     }
-    ESP_ERROR_CHECK(system_start());
-    xTaskCreatePinnedToCore(ui_task, "ui", 4096, NULL, 3, NULL, 0);
+    log_heap("ble");
+    g_daq.system_init_err = system_start();
+    if (g_daq.system_init_err != ESP_OK) {
+        ESP_LOGE(TAG, "system task not available: %s", esp_err_to_name(g_daq.system_init_err));
+    }
+    log_heap("system");
+    if (xTaskCreatePinnedToCore(ui_task, "ui", 4096, NULL, 3, NULL, 0) != pdPASS) {
+        ESP_LOGE(TAG, "cannot start the UI task (no internal RAM): console and self-test off");
+    }
 }
