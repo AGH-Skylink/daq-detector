@@ -445,7 +445,7 @@ python tools/daq_term.py --uart COM3 --usb COM4            # COM numbers from th
 python tools/daq_term.py --uart COM3 --usb COM4 --plain --duration 30   # one line per second, no UI
 ```
 
-Keys: `s` stream on/off (on at start), `w` WAV on the PC (`recordings/`), `l` detection CSV on the PC
+Keys: `s` stream on/off (on at start), `w` WAV on the PC (one mono file per mic: `recordings/usb_<time>/M1.wav` … `M6.wav`), `l` detection CSV on the PC
 (`recordings/det_*.csv`), `r` SD recording, `i` identify, `h` ESP help, `c` clear counters, `q` quit.
 `--csv` writes the detection CSV from the start. The CSV has the columns of the SD card CSV plus `pc_time_s` (PC receive
 time, Unix seconds) to align it with other logs, e.g. the source position of `daq-sim/tools/live_source.py`. The

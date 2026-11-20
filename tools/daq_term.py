@@ -11,7 +11,8 @@ Usage:
 
 Keys:
   s  start/stop USB stream (host command S / X)
-  w  start/stop WAV recording on the PC (6 ch, 16 bit, 48 kHz; lost blocks filled with zeros)
+  w  start/stop WAV recording on the PC: one mono file per mic, recordings/usb_<time>/M1.wav .. M6.wav
+     (16 bit, 48 kHz; lost blocks filled with zeros)
   l  start/stop the detection CSV on the PC (columns of the SD card CSV + pc_time_s)
   r  SD recording on the ESP     i  identify (LED)     h  ESP help (output in the log)
   c  clear counters              q  quit
@@ -63,8 +64,8 @@ class UsbStream:
         self.lock = threading.Lock()
         self.running = True
         self.streaming = False
-        self.wav = None
-        self.wav_name = None
+        self.wav = None              # list of mono wave writers, one per mic (M1..M6), or None
+        self.wav_name = None         # folder of the current recording
         self.wav_frames = 0
         self.csv = None              # open detection CSV file
         self.csv_name = None
@@ -104,26 +105,33 @@ class UsbStream:
         self.port.write(b"S" if on else b"X")
         self.streaming = on
 
-    # PC-side WAV
+    # PC-side WAV: one mono file per mic
+    def _close_wav(self):
+        for w in self.wav:
+            w.close()
+        self.wav = None
+
     def toggle_wav(self):
         with self.lock:
             if self.wav:
-                self.wav.close()
-                self.wav = None
-                return f"WAV saved: {self.wav_name} ({self.wav_frames / 48000:.1f} s)"
+                self._close_wav()
+                return f"WAV saved: {self.wav_name}/M1..M{self.fmt[1]}.wav ({self.wav_frames / self.fmt[0]:.1f} s)"
             if not self.fmt:
                 return "WAV: no packets yet, start the stream first (s)"
             rate, ch, _ = self.fmt
-            os.makedirs("recordings", exist_ok=True)
             self.wav_name = os.path.join(
-                "recordings", datetime.datetime.now().strftime("usb_%Y%m%d_%H%M%S.wav"))
-            w = wave.open(self.wav_name, "wb")
-            w.setnchannels(ch)
-            w.setsampwidth(2)
-            w.setframerate(rate)
-            self.wav = w
+                "recordings", datetime.datetime.now().strftime("usb_%Y%m%d_%H%M%S"))
+            os.makedirs(self.wav_name, exist_ok=True)
+            writers = []
+            for c in range(ch):
+                w = wave.open(os.path.join(self.wav_name, f"M{c + 1}.wav"), "wb")
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(rate)
+                writers.append(w)
+            self.wav = writers
             self.wav_frames = 0
-            return f"WAV recording: {self.wav_name}"
+            return f"WAV recording: {self.wav_name}/M1..M{ch}.wav"
 
     # PC-side detection CSV
     def toggle_csv(self):
@@ -153,8 +161,7 @@ class UsbStream:
         self.running = False
         with self.lock:
             if self.wav:
-                self.wav.close()
-                self.wav = None
+                self._close_wav()
             if self.csv:
                 self.csv.close()
                 self.csv = None
@@ -283,11 +290,12 @@ class UsbStream:
         self.nsamp += frames
 
         if self.wav:
-            if gap:
-                self.wav.writeframes(bytes(gap * frames * ch * 2))
-                self.wav_frames += gap * frames
-            self.wav.writeframes(payload)
-            self.wav_frames += frames
+            pcm = np.frombuffer(payload, dtype="<i2").reshape(frames, ch)
+            for c, w in enumerate(self.wav):
+                if gap:
+                    w.writeframes(bytes(gap * frames * 2))
+                w.writeframes(np.ascontiguousarray(pcm[:, c]).astype("<i2").tobytes())
+            self.wav_frames += (gap + 1) * frames
 
     def snapshot(self):
         """Stats + levels since the previous snapshot."""
@@ -486,7 +494,7 @@ def render(usb, uart, msg, args):
         if s["fmt"]:
             t.add_row("format", f"{s['fmt'][0]} Hz × {s['fmt'][1]} ch × {s['fmt'][2]} fr", "", "")
         if s["wav"]:
-            t.add_row("WAV", Text(f"● {s['wav']}  {s['wav_s']:.1f} s", style="bold red"), "", "")
+            t.add_row("WAV", Text(f"● {s['wav']}/M1..M6.wav  {s['wav_s']:.1f} s", style="bold red"), "", "")
         if s["csv"]:
             t.add_row("CSV", Text(f"● {s['csv']}  {s['csv_lines']} lines", style="bold red"), "", "")
         t.add_row("detect", Text(det_summary(s), style="bold"), "", "")
