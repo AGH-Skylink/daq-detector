@@ -455,6 +455,29 @@ time, Unix seconds) to align it with other logs, e.g. the source position of `da
 python tools/daq_term.py --uart COM3 --usb COM4 --csv                    # detection CSV from the start
 python tools/daq_term.py --uart "" --usb COM4 --plain --csv --duration 60   # 60 s, no UI
 ``` Run it with the Windows Python (PowerShell), not from WSL: WSL does not see `COMx` ports.
+
+**PC localization** (`tools/pc_localize.py`, used by `daq_term.py`): the PC runs algorithms **A, B and C at the same
+time** on the streamed audio and shows one radar per algorithm (top view, azimuth 0 to the right, 90 up; `*` = source
+of the last frame, digit = confirmed speaker track, `4 5 6` = the arms) with the frame result, the speakers and the time
+per frame. It imports the Python reference of the firmware (`daq_sim` from the `daq-simulator` repository: same front end,
+`ls` = A, `srp` = B, `music` = C, `track`), so the results are those of the device algorithms on the same audio.
+Geometry and speed of sound come from the stream header (the device NVS values), otherwise from `main/config.h`.
+A and C run on every frame (~8 ms per 32 ms frame); B (SRP-PHAT, ~45 ms per frame in Python) runs in a separate process
+and skips voice frames it has no time for (`done NN%`); each algorithm has its own tracker (`--track`).
+
+```
+git clone https://github.com/AGH-Skylink/daq-simulator ..\daq-simulator    # once, next to daq-detector
+python tools/daq_term.py --uart COM3 --usb COM4                               # radars A / B / C
+python tools/daq_term.py --uart COM3 --usb COM4 --track AZEL --pc-alg AB      # other tracker mode, only A and B
+python tools/daq_term.py --uart "" --usb COM4 --plain                         # one 'pc A:… | B:… | C:…' line per second
+```
+
+Options: `--sim PATH` (folder with `daq_sim/`, default: `../daq-simulator`, `../daq-sim` or `$DAQ_SIM`), `--track AZ|AZEL|ELLIPSE`,
+`--pc-alg` (subset of `ABC`), `--config` (default geometry), `--no-pc-loc`. Key `p` turns it on/off, `c` also restarts the
+trackers. `queue` / `dropped` must stay near 0 (otherwise the PC is too slow: use `--pc-alg AC`). The panel needs a
+terminal of about 100 × 50 characters (`--log-lines 4` saves space). In a terminal without the UI, `--plain` prints
+the same results as text. Checked on simulated recordings streamed in real time (`daq-sim` `simulate.render`): one source
+at 60° / 20° / 2 m is found by A, B and C; two speakers in a 6 × 5 × 3 m room with RT60 0.5 s are found by B and C, not by A.
 One program per port: close the VS Code monitor first.
 
 ## First run checklist

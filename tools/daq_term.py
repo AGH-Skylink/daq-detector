@@ -4,16 +4,20 @@
   USB  (native USB-Serial-JTAG): binary stream of DAQ1 packets -> parsed, stats, levels, optional WAV;
        DAQT text packets = detection log (one CSV line per DSP frame) -> last result, optional CSV file.
   UART (CP2102N console):        log lines + status line, keys forwarded to the ESP console.
+  PC localization (tools/pc_localize.py): algorithms A, B and C at the same time on the streamed audio,
+       with the Python reference of the firmware (daq-sim), shown as three radars.
 
 Usage:
   pip install pyserial numpy rich
   python tools/daq_term.py --uart COM3 --usb COM4
+  python tools/daq_term.py --uart COM3 --usb COM4 --sim ../daq-simulator --track AZEL
 
 Keys:
   s  start/stop USB stream (host command S / X)
   w  start/stop WAV recording on the PC: one mono file per mic, recordings/usb_<time>/M1.wav .. M6.wav
      (16 bit, 48 kHz; lost blocks filled with zeros)
   l  start/stop the detection CSV on the PC (columns of the SD card CSV + pc_time_s)
+  p  PC localization on/off
   r  SD recording on the ESP     i  identify (LED)     h  ESP help (output in the log)
   c  clear counters              q  quit
 
@@ -74,6 +78,7 @@ class UsbStream:
         self.det_columns = None      # column names from the header block
         self.det_header = None       # header block as received
         self.error = None
+        self.loc = None              # PcLocalizer (tools/pc_localize.py) or None
         self.reset_counters()
 
     def reset_counters(self):
@@ -241,6 +246,8 @@ class UsbStream:
             self.det_header = text
             self.det_columns = text.rstrip("\n").split("\n")[-1].split(",")
             self.det_last_frame = None
+            if self.loc:
+                self.loc.set_geometry_from_header(text)
             if self.csv_pending and not self.csv:
                 self._open_csv()
             return
@@ -284,13 +291,15 @@ class UsbStream:
         self.last_frames = frames
         self.packets += 1
 
-        x = np.frombuffer(payload, dtype="<i2").reshape(frames, ch).astype(np.float32)
+        pcm = np.frombuffer(payload, dtype="<i2").reshape(frames, ch)
+        if self.loc:
+            self.loc.feed(first_frame, rate, ch, pcm)
+        x = pcm.astype(np.float32)
         self.sumsq += np.einsum("ij,ij->j", x, x)
         self.peak = np.maximum(self.peak, np.abs(x).max(axis=0))
         self.nsamp += frames
 
         if self.wav:
-            pcm = np.frombuffer(payload, dtype="<i2").reshape(frames, ch)
             for c, w in enumerate(self.wav):
                 if gap:
                     w.writeframes(bytes(gap * frames * 2))
@@ -516,6 +525,9 @@ def render(usb, uart, msg, args):
             title += f"  [red]{s['error']}[/red]"
         parts.append(Panel(Group(t, Text(""), lv), title=title, border_style="cyan"))
 
+    if usb and usb.loc:
+        parts.append(render_loc(usb.loc.snapshot()))
+
     if uart:
         status, lines = uart.snapshot(args.log_lines)
         st = Text(status or "(waiting for the status line…)", style="bold" if status else "dim")
@@ -526,9 +538,56 @@ def render(usb, uart, msg, args):
         parts.append(Panel(st, title=title + " · status", border_style="magenta"))
         parts.append(Panel(log, title="log", border_style="dim", height=args.log_lines + 2))
 
-    keys = "[b]s[/b] stream  [b]w[/b] WAV  [b]l[/b] CSV  [b]r[/b] SD rec  [b]i[/b] identify  [b]h[/b] help  [b]c[/b] clear  [b]q[/b] quit"
+    keys = "[b]s[/b] stream  [b]w[/b] WAV  [b]l[/b] CSV  [b]p[/b] PC loc  [b]r[/b] SD rec  [b]i[/b] identify  [b]h[/b] help  [b]c[/b] clear  [b]q[/b] quit"
     parts.append(Text.from_markup(keys + (f"   │ {msg}" if msg else "")))
     return Group(*parts)
+
+
+def render_loc(snap):
+    """Panel with the PC localization: one radar + numbers per algorithm."""
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+    from pc_localize import fmt_source, radar
+
+    grid = Table.grid(padding=(0, 3))
+    cols = []
+    for a, s in snap["algs"].items():
+        grid.add_column()
+        t = Text()
+        t.append(f"{a}  {s['name']}\n", style="bold")
+        rad = radar(s["sources"], s["tracks"])
+        for line in rad:
+            for ch in line:
+                style = "bold yellow" if ch == "*" else ("bold green" if ch.isdigit() and ch not in "456" else
+                                                         ("cyan" if ch in "456+" else "dim"))
+                t.append(ch, style=style)
+            t.append("\n")
+        kind = {"P": "position", "D": "direction only", "-": "no result"}[s["kind"]]
+        t.append(f"frame: {kind}\n", style="bold" if s["sources"] else "dim")
+        for src in s["sources"][:2]:
+            t.append("  " + fmt_source(*src) + "\n", style="yellow")
+        if s["residual_us"] is not None:
+            t.append(f"  fit residual {s['residual_us']:.1f} us\n", style="dim")
+        t.append(f"speakers: {len(s['tracks'])}\n", style="bold green" if s["tracks"] else "dim")
+        for tid, az, el, dist, conf in s["tracks"][:3]:
+            t.append(f"  #{tid} " + fmt_source(az, el, dist, conf) + "\n", style="green")
+        pct = 100 * s["computed"] / s["voice"] if s["voice"] else 100
+        t.append(f"{s['avg_ms']:.1f} ms/frame  voice {s['voice']}  done {pct:.0f}%  results {s['with_result']}",
+                 style="dim" if pct >= 99 else "yellow")
+        cols.append(t)
+    if cols:
+        grid.add_row(*cols)
+    info = (f"geometry: {snap['geometry']}  c={snap['c']:.1f} m/s  tracker {snap['track_mode']}  "
+            f"queue {snap['queue']}  dropped {snap['dropped']}  restarts {snap['resets']}")
+    if not snap["enabled"]:
+        info += "  [OFF, p = on]"
+    title = "PC localization (daq-sim)  ·  * frame source, digit = speaker track, 4 5 6 = arms"
+    if snap["error"]:
+        title += f"  [red]{snap['error']}[/red]"
+    from rich.console import Group
+    return Panel(Group(grid, Text(info, style="red" if snap["dropped"] else "dim")), title=title,
+                 border_style="green")
 
 
 def run_plain(usb, uart, args):
@@ -543,6 +602,9 @@ def run_plain(usb, uart, args):
                   f"resync={s['resyncs']} bad={s['bad']} jumps={s['jumps']} seq={s['seq']} dBFS {lv}",
                   flush=True)
             print("det", det_summary(s), flush=True)
+            if usb.loc:
+                from pc_localize import plain_line
+                print(plain_line(usb.loc.snapshot()), flush=True)
         if uart and uart.status:
             print("uart", uart.status, flush=True)
 
@@ -557,6 +619,12 @@ def main():
     ap.add_argument("--plain", action="store_true", help="no UI, print stats once per second")
     ap.add_argument("--duration", type=float, default=0, help="with --plain: stop after N s")
     ap.add_argument("--csv", action="store_true", help="write the detection CSV from the start (recordings/det_*.csv)")
+    ap.add_argument("--no-pc-loc", action="store_true", help="no localization on the PC")
+    ap.add_argument("--sim", help="daq-simulator folder (contains daq_sim/); default: next to daq-detector or $DAQ_SIM")
+    ap.add_argument("--track", default="AZ", choices=["AZ", "AZEL", "ELLIPSE"], help="tracker mode on the PC")
+    ap.add_argument("--pc-alg", default="ABC", help="algorithms on the PC, any of A, B, C (default ABC)")
+    ap.add_argument("--config", help="config.h with the default geometry (default: main/config.h); "
+                                     "the device geometry from the stream header wins")
     args = ap.parse_args()
 
     usb = uart = None
@@ -572,6 +640,16 @@ def main():
         sys.exit(f"Cannot open port: {e}")
     if usb and args.csv:
         usb.csv_pending = True
+    loc_msg = ""
+    if usb and not args.no_pc_loc:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        try:
+            from pc_localize import PcLocalizer
+            usb.loc = PcLocalizer(args.sim, args.config, args.track, args.pc_alg)
+            loc_msg = f"PC localization: daq-sim from {usb.loc.sim_path}"
+        except ImportError as e:
+            loc_msg = f"PC localization off: {e}"
+            print(loc_msg, file=sys.stderr)
     for th in threads:
         th.start()
     if usb and not args.no_autostart:
@@ -585,7 +663,7 @@ def main():
     else:
         from rich.live import Live
         keys = Keys()
-        msg = ""
+        msg = loc_msg
         try:
             with Live(render(usb, uart, msg, args), refresh_per_second=8, screen=True) as live:
                 while True:
@@ -601,8 +679,13 @@ def main():
                             msg = usb.toggle_wav()
                         elif k == "l" and usb:
                             msg = usb.toggle_csv()
+                        elif k == "p" and usb and usb.loc:
+                            usb.loc.enabled = not usb.loc.enabled
+                            msg = f"PC localization {'ON' if usb.loc.enabled else 'OFF'}"
                         elif k == "c" and usb:
                             usb.reset_counters()
+                            if usb.loc:
+                                usb.loc.reset()
                             msg = "counters cleared"
                         elif k in "rih" and uart:
                             uart.send(k)
@@ -620,6 +703,8 @@ def main():
         except serial.SerialException:
             pass
         usb.close()
+        if usb.loc:
+            usb.loc.close()
         if usb.wav_name:
             print(f"WAV: {usb.wav_name}")
         if usb.csv_name:
