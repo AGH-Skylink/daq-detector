@@ -104,7 +104,7 @@ def arrival_times(y, onset):
             w = max(r[m], 1e-3)
             rows.append(row * w)
             vals.append(tau * w)
-            peaks.append(r[m] / band.sum())
+            peaks.append(r[m] * nfft / (2 * band.sum()))   # 1 = identical signals, ~0.1 = unrelated
     rows.append(np.ones(6))
     vals.append(0.0)
     t, *_ = np.linalg.lstsq(np.array(rows), np.array(vals), rcond=None)
