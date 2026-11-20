@@ -45,6 +45,9 @@ K_GATE_SIGMA, K_GATE_MIN_DEG = 3.5, 20.0
 K_REACQUIRE = 5              # frames in a row outside the gate that agree with each other -> jump to them
 K_HOLD_S = 0.8               # keep showing the estimate this long without accepted measurements
 K_RESET_S = 3.0              # forget the source after this long
+K_MAX_SPEED_DPS = 90.0       # azimuth speed limit (a person walking around at ~1 m)
+K_COAST_DAMP = 0.7           # per frame without an accepted measurement the speed is multiplied by this, so the
+                             # estimate does not keep sweeping round while it is held
 
 
 class AzKalman:
@@ -82,12 +85,16 @@ class AzKalman:
                     self.since = 0
                     self.pending = []
                 else:
+                    self.x[1] *= K_COAST_DAMP
                     self.pending.append(circ_mean([m[0] for m in meas])[0])
                     if (len(self.pending) >= K_REACQUIRE and
                             max(abs(wrap180(p - circ_mean(self.pending)[0])) for p in self.pending) < K_GATE_MIN_DEG):
                         self._start(meas, circ_mean(self.pending)[0])
             self.x[0] %= 360.0
-            self.x[1] = float(np.clip(self.x[1], -180.0, 180.0))
+        elif self.x is not None:
+            self.x[1] *= K_COAST_DAMP
+        if self.x is not None:
+            self.x[1] = float(np.clip(self.x[1], -K_MAX_SPEED_DPS, K_MAX_SPEED_DPS))
         if self.x is None:
             return None
         if self.since * self.dt > K_RESET_S:

@@ -491,8 +491,8 @@ detected (VAD floor = quietest frame of the last 30 s); `--vad device` uses the 
 counting as voice after ~6 s. **K = Kalman B+R+G** (default `--pc-alg BGRK --show BRK`): the smoothed result. One azimuth Kalman filter (constant
 velocity) takes the per-frame directions of B, R and G as separate measurements, each with its own accuracy and outlier
 gate (3.5 σ, at least 20°); 5 frames in a row that agree outside the gate make it jump (the source moved fast); the estimate
-is held 0.8 s without measurements and dropped after 3 s. Tuned on a 112 s session with a source walking around the array:
-on frames where the methods agree it covers 99.8 % with a median error of 2.9–3.5° and ~2 % of errors above 30°, against
+is held 0.8 s without measurements (its speed decays, limit 90°/s, so a held estimate does not sweep round) and dropped after 3 s. Tuned on a 112 s session with a source walking around the array:
+on frames where the methods agree it covers 99.9 % with a median error of 2.8° and 1.2 % of errors above 30°, against
 10.5° / 12 % for the tracker of H and ~25° jumps per frame of raw B. The constants are `K_*` in `pc_localize.py`.
 
 **Session log** (key `g`, or `--pc-log` from the start): `recordings/pc_<time>/` with `frames.csv` (every frame: voice
