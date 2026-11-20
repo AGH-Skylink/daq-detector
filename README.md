@@ -480,6 +480,23 @@ the same results as text. Checked on simulated recordings streamed in real time 
 at 60° / 20° / 2 m is found by A, B and C; two speakers in a 6 × 5 × 3 m room with RT60 0.5 s are found by B and C, not by A.
 One program per port: close the VS Code monitor first.
 
+### `tools/clap_test.py`
+Clap test for the array itself: channel order, real distances between the mics, digital time offsets and the mic
+coordinates. Record with `daq_term.py` (key `w`) while clapping (or tapping a pen on the table) 2–3 times 1–2 cm from M1,
+then M2 … M6, ~1 s between claps and ~2 s between mics, then:
+
+```
+python tools/clap_test.py recordings/usb_20261120_133000
+```
+
+It finds the claps and, for each, the arrival time at every mic (GCC-PHAT between the channels, ±3 ms, no geometry
+assumed). The mic that hears a clap first is the one you clapped at, so the order of the groups checks `DAQ_CHANNEL_MAP` /
+the wiring. A clap at mic i and one at mic j give the distance between them (mean of the two delays) and the
+difference of their digital offsets (half the difference: a real acoustic delay is the same both ways). With claps at
+all six mics the positions follow from the distances (classical MDS, origin = centre of M1–M3, M1 at 90°, arms
+below) and are printed as `mic N X Y Z` console commands. Checked on synthetic claps 1.5 cm from the mics: geometry
+within ~10 mm, a swapped M4/M5 and a 35-sample offset on one channel are reported.
+
 ## First run checklist
 
 1. **Tap test**: tap M1..M6 one by one, see which level rises and fix `DAQ_CHANNEL_MAP` in `config.h`.
