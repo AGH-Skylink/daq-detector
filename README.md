@@ -472,8 +472,18 @@ python tools/daq_term.py --uart COM3 --usb COM4 --track AZEL --pc-alg AB      # 
 python tools/daq_term.py --uart "" --usb COM4 --plain                         # one 'pc A:… | B:… | C:…' line per second
 ```
 
+**Group mode** (default `--pc-alg GRH`, for an array whose two groups are not in a known position relative to each other):
+`G` = direction from the M1–M3 triangle only, `R` = from the M4–M6 arms only (each from its own 3 pairs, plane wave in the group
+plane: azimuth and |elevation|, no distance), `H` = hybrid. A far-field direction does not depend on where a group is, only on how it
+is rotated: the panel shows the running difference `az(M4–M6) − az(M1–M3)` over frames where both groups are consistent
+(closure |τab − τac + τbc| ≤ 25 µs for M1–M3, ≤ 80 µs for M4–M6) as the rotation of the arms group (`--group-offset DEG` fixes it).
+The hybrid rotates the arms direction into the body frame and averages both, weighted by aperture and closure error; if they
+still differ by more than 30° it keeps the more accurate one. `A`, `B`, `C` use the whole array and need the full geometry.
+Offline, the same code on a recording: `python tools/pc_localize.py recordings/usb_… [--pc-alg GRHABC]` (summary per algorithm
+and the matched rotation).
+
 Options: `--sim PATH` (folder with `daq_sim/`, default: `../daq-simulator`, `../daq-sim` or `$DAQ_SIM`), `--track AZ|AZEL|ELLIPSE`,
-`--pc-alg` (subset of `ABC`), `--config` (default geometry), `--no-pc-loc`. Key `p` turns it on/off, `c` also restarts the
+`--pc-alg` (any of `ABCGRH`), `--config` (default geometry), `--no-pc-loc`. Key `p` turns it on/off, `c` also restarts the
 trackers. `queue` / `dropped` must stay near 0 (otherwise the PC is too slow: use `--pc-alg AC`). The panel needs a
 terminal of about 100 × 50 characters (`--log-lines 4` saves space). In a terminal without the UI, `--plain` prints
 the same results as text. Checked on simulated recordings streamed in real time (`daq-sim` `simulate.render`): one source

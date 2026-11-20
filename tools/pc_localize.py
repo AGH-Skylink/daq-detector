@@ -5,6 +5,8 @@ Uses the Python reference of the firmware (`daq-sim`, repository daq-simulator):
 B (daq_sim.srp, SRP-PHAT) and C (daq_sim.music, MUSIC on M1-M3), each followed by its own tracker
 (daq_sim.track), so the results can be compared with each other and with the ESP.
 
+Group mode (G, R, H; the default while the relative position of the two mic groups is not known): see GROUP_*.
+
 Threads and processes:
   feed()      called by the USB reader for every audio packet, only queues the block,
   main        framing + TDOA + A + C + trackers A, C for every frame (~8 ms per 32 ms frame),
@@ -27,8 +29,49 @@ from pathlib import Path
 
 import numpy as np
 
-ALGS = ("A", "B", "C")
-ALG_NAMES = {"A": "GCC-PHAT + LS", "B": "SRP-PHAT", "C": "MUSIC M1-M3"}
+ALGS = ("A", "B", "C", "G", "R", "H")
+ALG_NAMES = {"A": "GCC-PHAT + LS", "B": "SRP-PHAT", "C": "MUSIC M1-M3",
+             "G": "group M1-M3", "R": "group M4-M6", "H": "hybrid M1-M3 + M4-M6"}
+
+# Group mode (G, R, H): the shape of each group (body M1-M3, arms M4-M6) is known, their relative position is not.
+# Each group gives a far-field direction from its own 3 pairs only (plane wave in the group plane: azimuth and
+# |elevation|), which does not depend on where the group is. The two azimuths are compared: their running
+# difference is the rotation of the arms group relative to the body (MATCH_*), and the hybrid (H) combines both
+# directions in the body frame, weighted by their accuracy (aperture and closure error).
+GROUP_BODY, GROUP_ARMS = (0, 1, 2), (3, 4, 5)
+CLOSURE_MAX_US = {"G": 25.0, "R": 80.0}       # |tau_ab - tau_ac + tau_bc| above this = inconsistent frame
+CLOSURE_FLOOR_US = {"G": 5.0, "R": 10.0}       # accuracy floor for the weights
+MATCH_FRAMES = 150                             # frames with both groups valid used for the offset (~5 s of voice)
+MATCH_MIN = 10                                 # before this many, the hybrid does not rotate the arms result
+DISAGREE_DEG = 30.0                            # larger difference after the offset: keep the more accurate group
+
+
+def group_direction(geometry, r, grp):
+    """Plane-wave direction from the 3 pairs of one group (mics assumed in a horizontal plane).
+    Returns dict(az, el, closure_us, sigma_deg, peak, ok) - el is |elevation| (the sign is not observable)."""
+    from daq_sim.geometry import PAIRS
+    m = geometry.mics_m
+    pairs = [(grp[0], grp[1]), (grp[0], grp[2]), (grp[1], grp[2])]
+    a = np.array([(m[j] - m[i])[:2] for i, j in pairs])
+    y = np.array([r.tau_s[PAIRS.index(p)] for p in pairs])
+    v, *_ = np.linalg.lstsq(a, y, rcond=None)
+    closure = (y[0] - y[1] + y[2]) * 1e6
+    cos_el = float(np.linalg.norm(v) * geometry.c)
+    az = float(np.degrees(np.arctan2(v[1], v[0])) % 360.0)
+    el = float(np.degrees(np.arccos(min(cos_el, 1.0))))
+    peak = float(min(r.peak[PAIRS.index(p)] for p in pairs))
+    aperture_us = max(np.linalg.norm(m[j] - m[i]) for i, j in pairs) / geometry.c * 1e6
+    return dict(az=az, el=el, cos_el=cos_el, closure_us=closure, peak=peak, aperture_us=aperture_us)
+
+
+def circ_mean(deg, w=None):
+    z = np.exp(1j * np.radians(np.asarray(deg, dtype=float)))
+    m = np.average(z, weights=w) if w is not None else np.mean(z)
+    return float(np.degrees(np.angle(m)) % 360.0), float(abs(m))
+
+
+def wrap180(d):
+    return (d + 180.0) % 360.0 - 180.0
 SHOW_S = 1.0                 # a frame result is shown for this long after the frame
 B_IN_FLIGHT = 2              # SRP-PHAT frames queued / running in the B process
 
@@ -92,7 +135,7 @@ class AlgState:
 
 
 class PcLocalizer:
-    def __init__(self, sim_path=None, config_h=None, track_mode="AZ", algs="ABC"):
+    def __init__(self, sim_path=None, config_h=None, track_mode="AZ", algs="GRH", group_offset=None):
         self.sim_path = find_daq_sim(sim_path)
         from daq_sim.geometry import load_geometry
         from daq_sim.track import MODES
@@ -125,6 +168,8 @@ class PcLocalizer:
             self.b_proc = ctx.Process(target=_b_worker, args=(self.sim_path, self.b_jobs, self.b_out), daemon=True)
             self.b_proc.start()
         self.state = {a: AlgState(a) for a in ALGS}
+        self.match = collections.deque(maxlen=MATCH_FRAMES)   # az(arms) - az(body), frames with both valid
+        self.fixed_offset = group_offset                       # --group-offset: no matching, use this rotation
         self._rebuild = None                       # (geometry, source name): rebuild in the worker
         self._build()
         self.main_thread = threading.Thread(target=self._run, daemon=True)
@@ -214,6 +259,8 @@ class PcLocalizer:
             r = self.est.process(self.buf[:FRAME_LEN], frame)
             self.buf = self.buf[HOP:]
             self.buf_start += HOP
+            if any(a in self.algs for a in "GRH"):
+                self._groups(r)
             if "A" in self.algs:
                 self._alg_a(r)
             if "C" in self.algs:
@@ -246,6 +293,58 @@ class PcLocalizer:
                         s.kind, s.sources, s.residual_us = kind, list(sources), residual
                         s.last_frame, s.last_t = r.frame, time.monotonic()
             s.tracks = [(t.id, t.az_deg, t.el_deg, t.dist_m, t.confidence) for t in tracks]
+
+    def _group(self, key, r):
+        d = group_direction(self.geometry, r, GROUP_BODY if key == "G" else GROUP_ARMS)
+        d["ok"] = (abs(d["closure_us"]) <= CLOSURE_MAX_US[key] and 0.2 <= d["cos_el"] <= 1.3)
+        # angular accuracy ~ timing error / aperture (rad -> deg)
+        d["sigma_deg"] = float(np.degrees(max(abs(d["closure_us"]), CLOSURE_FLOOR_US[key]) / d["aperture_us"]))
+        return d
+
+    def match_offset(self):
+        """Rotation of the arms group relative to the body: (offset deg, frames, spread deg) or None."""
+        if self.fixed_offset is not None:
+            return self.fixed_offset, -1, 0.0
+        if len(self.match) < MATCH_MIN:
+            return None
+        mean, rlen = circ_mean(self.match)
+        spread = float(np.degrees(np.sqrt(-2 * np.log(max(rlen, 1e-9)))))
+        return wrap180(mean), len(self.match), spread
+
+    def _groups(self, r):
+        t0 = time.perf_counter()
+        if not r.voice:
+            for a in "GRH":
+                if a in self.algs:
+                    self._publish(a, r, "-", [], 0.0)
+            return
+        g, a = self._group("G", r), self._group("R", r)
+        if g["ok"] and a["ok"]:
+            self.match.append(wrap180(a["az"] - g["az"]))
+        off = self.match_offset()
+        ms = (time.perf_counter() - t0) * 1000
+        for key, d in (("G", g), ("R", a)):
+            if key in self.algs:
+                src = [(d["az"], d["el"], 0.0, d["peak"])] if d["ok"] else []
+                self._publish(key, r, "D" if src else "-", src, ms, residual=d["closure_us"] if src else None)
+        if "H" not in self.algs:
+            return
+        cands = []
+        if g["ok"]:
+            cands.append((g["az"], g["el"], g["sigma_deg"], g["peak"]))
+        if a["ok"] and off is not None:          # arms direction in the body frame
+            cands.append(((a["az"] - off[0]) % 360.0, a["el"], a["sigma_deg"], a["peak"]))
+        elif a["ok"] and not g["ok"]:
+            cands.append((a["az"], a["el"], a["sigma_deg"], a["peak"]))   # no offset yet: arms as they are
+        if not cands:
+            self._publish("H", r, "-", [], ms)
+            return
+        if len(cands) == 2 and abs(wrap180(cands[0][0] - cands[1][0])) > DISAGREE_DEG:
+            cands = [min(cands, key=lambda c: c[2])]     # disagree: the more accurate one
+        w = [1.0 / c[2] ** 2 for c in cands]
+        az, _ = circ_mean([c[0] for c in cands], w)
+        el = float(np.average([c[1] for c in cands], weights=w))
+        self._publish("H", r, "D", [(az, el, 0.0, max(c[3] for c in cands))], ms)
 
     def _alg_a(self, r):
         from daq_sim.geometry import to_spherical
@@ -349,7 +448,8 @@ class PcLocalizer:
                     with_result=s.with_result, avg_ms=(s.busy_s * 1000 / s.computed) if s.computed else 0.0,
                     last_ms=s.last_ms, kind=s.kind if fresh else "-", sources=list(s.sources) if fresh else [],
                     tracks=list(s.tracks), residual_us=s.residual_us if fresh else None)
-            return dict(algs=out, geometry=self.geometry_src, c=self.geometry.c, track_mode=self.track_mode,
+            match = self.match_offset() if any(a in self.algs for a in "GRH") else None
+            return dict(algs=out, match=match, geometry=self.geometry_src, c=self.geometry.c, track_mode=self.track_mode,
                         queue=self.q.qsize(), dropped=self.dropped_blocks, resets=self.resets,
                         error=self.error, enabled=self.enabled)
 
@@ -357,6 +457,7 @@ class PcLocalizer:
         """Clear the statistics and the trackers (key c)."""
         with self.lock:
             self.state = {a: AlgState(a) for a in ALGS}
+            self.match.clear()
             self.dropped_blocks = self.resets = 0
             if self._rebuild is None:
                 self._rebuild = (self.geometry, self.geometry_src)   # trackers restart in the worker thread
@@ -429,4 +530,75 @@ def plain_line(snap):
             txt += " (" + ",".join(f"{t[1]:.0f}" for t in s["tracks"]) + ")"
         txt += f" {s['avg_ms']:.1f}ms {s['computed']}/{s['voice']}"
         parts.append(txt)
+    m = snap.get("match")
+    if m:
+        parts.append(f"match arms-body {m[0]:+.0f} deg" + (f" ({m[1]} frames, spread {m[2]:.0f})" if m[1] >= 0 else " (fixed)"))
     return "pc " + " | ".join(parts) + f" | q={snap['queue']} drop={snap['dropped']}"
+
+
+# ---------------------------------------------------------------------- offline: same code on a recording
+
+def _summary(loc, per_frame):
+    print(f"\n{'alg':4s} {'name':22s} {'voice':>5s} {'results':>7s}  {'az mean':>7s} {'spread':>6s}  {'|el| med':>8s}  speakers (last)")
+    for a in loc.algs:
+        rows = [p for p in per_frame if p[0] == a]
+        az = [p[1] for p in rows]
+        s = loc.state[a]
+        if az:
+            m, rl = circ_mean(az)
+            spread = np.degrees(np.sqrt(-2 * np.log(max(rl, 1e-9))))
+            el = np.median([p[2] for p in rows])
+            print(f"{a:4s} {ALG_NAMES[a]:22s} {s.voice:5d} {len(rows):7d}  {m:7.1f} {spread:6.1f}  {el:8.1f}  "
+                  + (", ".join(f"#{t[0]} az {t[1]:.0f}" for t in s.tracks) or "-"))
+        else:
+            print(f"{a:4s} {ALG_NAMES[a]:22s} {s.voice:5d} {0:7d}")
+    m = loc.match_offset()
+    if m:
+        print(f"\nmatch: M4-M6 rotated {m[0]:+.1f} deg relative to M1-M3"
+              + (f" (last {m[1]} frames with both groups valid, spread {m[2]:.1f} deg)" if m[1] >= 0 else " (fixed)"))
+    elif any(a in loc.algs for a in "GRH"):
+        print("\nmatch: too few frames with both groups valid")
+
+
+def main():
+    import argparse
+    import wave
+    ap = argparse.ArgumentParser(description="PC localization on a recording (folder with M1..M6.wav from daq_term)")
+    ap.add_argument("rec")
+    ap.add_argument("--sim")
+    ap.add_argument("--config")
+    ap.add_argument("--pc-alg", default="GRH")
+    ap.add_argument("--track", default="AZ")
+    ap.add_argument("--group-offset", type=float)
+    args = ap.parse_args()
+    p = Path(args.rec)
+    ch = []
+    for m in range(1, 7):
+        with wave.open(str(p / f"M{m}.wav")) as w:
+            ch.append(np.frombuffer(w.readframes(w.getnframes()), "<i2"))
+    n = min(len(c) for c in ch)
+    x = np.stack([c[:n] for c in ch], axis=1)
+    loc = PcLocalizer(args.sim, args.config, args.track.upper(), args.pc_alg, args.group_offset)
+    per_frame = []
+    orig = loc._publish
+
+    def spy(alg, r, kind, sources, ms, computed=True, residual=None):
+        if sources and r is not None and r.voice:
+            per_frame.append((alg, sources[0][0], sources[0][1]))
+        orig(alg, r, kind, sources, ms, computed, residual)
+    loc._publish = spy
+    blk = 320
+    for k in range(0, n - blk + 1, blk):
+        while loc.q.qsize() > 300:
+            time.sleep(0.01)
+        loc.feed(k, 48000, 6, x[k:k + blk])
+    while loc.q.qsize() or (loc.b_proc and (loc.b_order or loc.b_inflight)):
+        time.sleep(0.05)
+    time.sleep(0.3)
+    print(f"{p}: {n / 48000:.1f} s, geometry {loc.geometry_src}")
+    _summary(loc, per_frame)
+    loc.close()
+
+
+if __name__ == "__main__":
+    main()

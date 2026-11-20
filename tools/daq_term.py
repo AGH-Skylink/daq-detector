@@ -568,7 +568,8 @@ def render_loc(snap):
         for src in s["sources"][:2]:
             t.append("  " + fmt_source(*src) + "\n", style="yellow")
         if s["residual_us"] is not None:
-            t.append(f"  fit residual {s['residual_us']:.1f} us\n", style="dim")
+            label = "closure" if a in "GR" else "fit residual"
+            t.append(f"  {label} {s['residual_us']:.1f} us\n", style="dim")
         t.append(f"speakers: {len(s['tracks'])}\n", style="bold green" if s["tracks"] else "dim")
         for tid, az, el, dist, conf in s["tracks"][:3]:
             t.append(f"  #{tid} " + fmt_source(az, el, dist, conf) + "\n", style="green")
@@ -578,7 +579,14 @@ def render_loc(snap):
         cols.append(t)
     if cols:
         grid.add_row(*cols)
-    info = (f"geometry: {snap['geometry']}  c={snap['c']:.1f} m/s  tracker {snap['track_mode']}  "
+    m = snap.get("match")
+    match = ""
+    if m:
+        match = (f"match: M4-M6 rotated {m[0]:+.0f} deg vs M1-M3" +
+                 (f" ({m[1]} frames, spread {m[2]:.0f} deg)" if m[1] >= 0 else " (fixed)") + "  ")
+    elif any(a in snap["algs"] for a in "GRH"):
+        match = "match: waiting for frames with both groups valid  "
+    info = (match + f"geometry: {snap['geometry']}  c={snap['c']:.1f} m/s  tracker {snap['track_mode']}  "
             f"queue {snap['queue']}  dropped {snap['dropped']}  restarts {snap['resets']}")
     if not snap["enabled"]:
         info += "  [OFF, p = on]"
@@ -622,7 +630,11 @@ def main():
     ap.add_argument("--no-pc-loc", action="store_true", help="no localization on the PC")
     ap.add_argument("--sim", help="daq-simulator folder (contains daq_sim/); default: next to daq-detector or $DAQ_SIM")
     ap.add_argument("--track", default="AZ", choices=["AZ", "AZEL", "ELLIPSE"], help="tracker mode on the PC")
-    ap.add_argument("--pc-alg", default="ABC", help="algorithms on the PC, any of A, B, C (default ABC)")
+    ap.add_argument("--pc-alg", default="GRH",
+                    help="algorithms on the PC: A, B, C (whole array, need the full geometry), G (group M1-M3), "
+                         "R (group M4-M6), H (hybrid of G and R); default GRH")
+    ap.add_argument("--group-offset", type=float, help="rotation of the M4-M6 group relative to M1-M3 in degrees "
+                                                       "(default: matched from the data)")
     ap.add_argument("--config", help="config.h with the default geometry (default: main/config.h); "
                                      "the device geometry from the stream header wins")
     args = ap.parse_args()
@@ -645,7 +657,7 @@ def main():
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         try:
             from pc_localize import PcLocalizer
-            usb.loc = PcLocalizer(args.sim, args.config, args.track, args.pc_alg)
+            usb.loc = PcLocalizer(args.sim, args.config, args.track, args.pc_alg, args.group_offset)
             loc_msg = f"PC localization: daq-sim from {usb.loc.sim_path}"
         except ImportError as e:
             loc_msg = f"PC localization off: {e}"
